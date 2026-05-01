@@ -17,7 +17,8 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { readFileSync } from 'node:fs'
+import { readFileSync, watch, mkdirSync } from 'node:fs'
+import { unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -90,6 +91,42 @@ const mcp = new Server(
 
 let mmClient: MattermostClient
 
+// ---------------------------------------------------------------------------
+// Typing keepalive
+// ---------------------------------------------------------------------------
+//
+// Mattermost displays the typing indicator for ~5s before fading. To keep it
+// visible while the model works, re-send every 4s. Stop signals:
+//   - reply/post tool call (response delivered)
+//   - Stop-hook drops `${STATE_DIR}/typing-stop-${channel_id}` (turn finished)
+//   - 5-min safety timeout
+
+const TYPING_INTERVAL_MS = 4_000
+const TYPING_MAX_MS = 5 * 60_000
+const activeTypers = new Map<string, { timer: ReturnType<typeof setInterval>; deadline: number }>()
+
+function startTyping(channelId: string) {
+  stopTyping(channelId)
+  const deadline = Date.now() + TYPING_MAX_MS
+  void mmClient.sendTyping(channelId)
+  const timer = setInterval(() => {
+    if (Date.now() > deadline) {
+      stopTyping(channelId)
+      return
+    }
+    void mmClient.sendTyping(channelId)
+  }, TYPING_INTERVAL_MS)
+  activeTypers.set(channelId, { timer, deadline })
+}
+
+function stopTyping(channelId: string) {
+  const entry = activeTypers.get(channelId)
+  if (entry) {
+    clearInterval(entry.timer)
+    activeTypers.delete(channelId)
+  }
+}
+
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
@@ -151,6 +188,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (!text || !text.trim()) return emptyTextError('reply')
     try {
       await mmClient.postMessage(channel_id, text)
+      stopTyping(channel_id)
       return { content: [{ type: 'text' as const, text: 'sent' }] }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -163,6 +201,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (!text || !text.trim()) return emptyTextError('post')
     try {
       await mmClient.postMessage(MATTERMOST_CHANNEL_ID, text)
+      stopTyping(MATTERMOST_CHANNEL_ID)
       return { content: [{ type: 'text' as const, text: `sent to ${MATTERMOST_CHANNEL_ID}` }] }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -236,8 +275,9 @@ mmClient = new MattermostClient({
     // Sender gating
     if (!isAllowed(post.user_id)) return
 
-    // Show typing indicator while Claude processes
-    mmClient.sendTyping(post.channel_id)
+    // Show typing indicator while Claude processes — keep alive until the
+    // agent calls reply/post or the Stop hook drops a stop marker.
+    startTyping(post.channel_id)
 
     // Check for permission verdict before forwarding as chat
     const verdict = PERMISSION_REPLY_RE.exec(post.message)
@@ -276,6 +316,21 @@ mmClient = new MattermostClient({
   onDisconnected() {
     console.error('[mattermost-channel] Disconnected, will reconnect...')
   },
+})
+
+// Watch the typing marker dir for stop signals dropped by
+// hooks/mattermost-autopost.sh. File name format: `typing-stop-<channel_id>`
+// (empty content). Lives under /tmp because it's purely ephemeral and the
+// shared mattermost STATE_DIR is root-owned on some hosts.
+const TYPING_DIR = '/tmp/mattermost-typing'
+mkdirSync(TYPING_DIR, { recursive: true })
+const STOP_PREFIX = 'typing-stop-'
+watch(TYPING_DIR, (_event, filename) => {
+  if (!filename || !filename.startsWith(STOP_PREFIX)) return
+  const channelId = filename.slice(STOP_PREFIX.length)
+  if (!channelId) return
+  stopTyping(channelId)
+  unlink(join(TYPING_DIR, filename)).catch(() => {})
 })
 
 await mmClient.connect()

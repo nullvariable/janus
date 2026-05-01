@@ -76,6 +76,15 @@ d=json.load(open('$MCP_JSON'))
 print(d['mcpServers']['mattermost']['env']['MATTERMOST_CHANNEL_ID'])
 " 2>/dev/null)
 
+# Signal the mattermost MCP server to stop the typing keepalive for this
+# turn. The server's fs.watch on /tmp/mattermost-typing clears the timer
+# and removes the marker. No-op if no typer is active for this channel.
+TYPING_DIR=/tmp/mattermost-typing
+if [[ -n "$MM_CHANNEL" ]]; then
+  mkdir -p "$TYPING_DIR" 2>/dev/null || true
+  : > "$TYPING_DIR/typing-stop-$MM_CHANNEL" 2>/dev/null || true
+fi
+
 # Read heartbeat config flags
 HB_AUTOPOST=$(python3 -c "
 import json
