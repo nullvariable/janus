@@ -1,0 +1,4 @@
+{
+  "hindsightApiUrl": "http://your-hindsight-host:8888",
+  "dynamicBankId": true
+}

@@ -1,0 +1,12 @@
+{
+  "name": "janus-cli",
+  "version": "0.1.0",
+  "description": "CLI for the Janus multi-agent container",
+  "private": true,
+  "bin": {
+    "janus": "./bin/janus"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

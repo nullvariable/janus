@@ -1,0 +1,196 @@
+#!/usr/bin/env node
+/**
+ * janus — CLI for the Janus multi-agent container.
+ *
+ * Zero deps. Wraps `docker exec` + `tmux` to attach to or talk to running
+ * Claude Code agents inside the `claude-agents` container.
+ */
+
+const { spawnSync } = require('node:child_process')
+
+const CONTAINER = 'claude-agents'
+const SESSION = 'claude-agents'
+
+function usage(code = 0) {
+  process.stdout.write(`janus — Janus multi-agent container CLI
+
+Usage:
+  janus list                List agent windows in the running session
+  janus attach [agent]      Attach to the tmux session, optionally jumping to <agent>
+  janus send <agent> <msg>  Send a single-line message into <agent>'s prompt
+  janus restart [agent]     Restart one or all agent panes
+  janus help                Show this help
+
+  janus update              Restart the container (entrypoint pulls latest claude-code)
+
+Not yet implemented:
+  janus status              Context usage and running state per agent
+
+Inside an attached session:
+  Ctrl-b d        detach (agents keep running)
+  Ctrl-b n / p    next / previous window
+  Ctrl-b 0..N     jump to window by index
+`)
+  process.exit(code)
+}
+
+function ensureContainerRunning() {
+  const r = spawnSync('docker', ['inspect', '-f', '{{.State.Running}}', CONTAINER], { encoding: 'utf8' })
+  if (r.status !== 0 || r.stdout.trim() !== 'true') {
+    console.error(`error: container "${CONTAINER}" is not running`)
+    console.error(`try: cd ~/projects/janus && docker compose up -d`)
+    process.exit(1)
+  }
+}
+
+function listAgents() {
+  ensureContainerRunning()
+  const r = spawnSync(
+    'docker',
+    ['exec', CONTAINER, 'tmux', 'list-windows', '-t', SESSION, '-F', '#{window_index}:#{window_name}'],
+    { encoding: 'utf8' },
+  )
+  if (r.status !== 0) {
+    console.error(r.stderr || 'failed to list tmux windows')
+    process.exit(1)
+  }
+  return r.stdout
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      const [index, ...nameParts] = line.split(':')
+      return { index, name: nameParts.join(':') }
+    })
+}
+
+function cmdList() {
+  const agents = listAgents()
+  for (const a of agents) console.log(`${a.index}\t${a.name}`)
+}
+
+function cmdAttach(agent) {
+  ensureContainerRunning()
+  const args = ['exec', '-it', CONTAINER, 'tmux', 'attach', '-t', SESSION]
+  if (agent) {
+    args.push(';', 'select-window', '-t', agent)
+  }
+  const r = spawnSync('docker', args, { stdio: 'inherit' })
+  process.exit(r.status ?? 1)
+}
+
+function cmdSend(agent, message) {
+  if (!agent || !message) {
+    console.error('usage: janus send <agent> <message>')
+    process.exit(1)
+  }
+  ensureContainerRunning()
+
+  // Verify the target window exists so we get a friendly error rather than a
+  // tmux "can't find window" message.
+  const agents = listAgents()
+  if (!agents.some((a) => a.name === agent)) {
+    console.error(`error: no agent window named "${agent}"`)
+    console.error(`available: ${agents.map((a) => a.name).join(', ')}`)
+    process.exit(1)
+  }
+
+  const target = `${SESSION}:${agent}`
+
+  // send-keys -l sends literal text (no key interpretation), then a separate
+  // call sends Enter to submit. Works for single-line messages; multi-line
+  // input would need a different approach (load-buffer / paste-buffer).
+  const sendText = spawnSync(
+    'docker',
+    ['exec', CONTAINER, 'tmux', 'send-keys', '-t', target, '-l', message],
+    { stdio: 'inherit' },
+  )
+  if (sendText.status !== 0) process.exit(sendText.status ?? 1)
+
+  const sendEnter = spawnSync(
+    'docker',
+    ['exec', CONTAINER, 'tmux', 'send-keys', '-t', target, 'Enter'],
+    { stdio: 'inherit' },
+  )
+  process.exit(sendEnter.status ?? 1)
+}
+
+function cmdRestart(agent) {
+  ensureContainerRunning()
+
+  const agents = listAgents()
+  let targets
+
+  if (agent) {
+    if (!agents.some((a) => a.name === agent)) {
+      console.error(`error: no agent window named "${agent}"`)
+      console.error(`available: ${agents.map((a) => a.name).join(', ')}`)
+      process.exit(1)
+    }
+    targets = [agent]
+  } else {
+    targets = agents.map((a) => a.name)
+  }
+
+  for (const name of targets) {
+    console.log(`restarting ${name}...`)
+    const target = `${SESSION}:${name}`
+    // Respawn the pane (killing it if still running), then mirror entrypoint's
+    // accept_startup_prompts in a background subshell so the CLI returns immediately.
+    const script =
+      `tmux respawn-pane -k -t ${target} && ` +
+      `(sleep 8 && tmux send-keys -t ${target} Enter 2>/dev/null; ` +
+      `sleep 5 && tmux send-keys -t ${target} Enter 2>/dev/null) &`
+    const r = spawnSync('docker', ['exec', CONTAINER, 'bash', '-c', script], { stdio: 'inherit' })
+    if (r.status !== 0) {
+      console.error(`failed to restart ${name}`)
+      process.exit(r.status ?? 1)
+    }
+  }
+}
+
+function notImplemented(name) {
+  console.error(`'${name}' is not implemented yet`)
+  process.exit(2)
+}
+
+function cmdUpdate() {
+  ensureContainerRunning()
+  console.log(`restarting ${CONTAINER} (entrypoint will pull latest claude-code)...`)
+  const r = spawnSync('docker', ['restart', CONTAINER], { stdio: 'inherit' })
+  if (r.status !== 0) {
+    console.error(`failed to restart ${CONTAINER}`)
+    process.exit(r.status ?? 1)
+  }
+}
+
+const [cmd, ...rest] = process.argv.slice(2)
+switch (cmd) {
+  case undefined:
+  case 'help':
+  case '-h':
+  case '--help':
+    usage()
+    break
+  case 'list':
+    cmdList()
+    break
+  case 'attach':
+    cmdAttach(rest[0])
+    break
+  case 'send':
+    cmdSend(rest[0], rest.slice(1).join(' '))
+    break
+  case 'restart':
+    cmdRestart(rest[0])
+    break
+  case 'update':
+    cmdUpdate()
+    break
+  case 'status':
+    notImplemented(cmd)
+    break
+  default:
+    console.error(`unknown command: ${cmd}`)
+    usage(1)
+}

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mattermost": {
+      "command": "/home/node/.bun/bin/bun",
+      "args": ["/app/mattermost-channel/server.ts"],
+      "env": {
+        "MATTERMOST_URL": "https://your-mattermost-host.example.com",
+        "MATTERMOST_BOT_TOKEN": "REPLACE_WITH_LINKS_BOT_TOKEN",
+        "MATTERMOST_CHANNEL_ID": "REPLACE_WITH_LINK_DUMP_CHANNEL_ID"
+      }
+    }
+  }
+}

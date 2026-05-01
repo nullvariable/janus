@@ -1,0 +1,105 @@
+services:
+  claude-agents:
+    build:
+      context: .
+      args:
+        # Set this to your host username so /home/<HOST_USER> inside the
+        # container resolves to /home/node. Required for any user-level MCP
+        # config in ~/.claude.json that uses absolute host paths.
+        HOST_USER: ${HOST_USER:-hostuser}
+    container_name: claude-agents
+    restart: unless-stopped
+    volumes:
+      # Claude Code credentials (OAuth tokens from claude.ai login)
+      - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude
+
+      # Claude Code user config (theme, onboarding state, etc.)
+      - ${CLAUDE_JSON:-~/.claude.json}:/home/node/.claude.json
+
+      # Mattermost channel state (access.json, .env fallback)
+      - ${MATTERMOST_STATE_DIR:-~/.claude/channels/mattermost}:/home/node/.claude/channels/mattermost
+
+      # Agent project directories. Each agent's source repo is bind-mounted
+      # at /agents/<name>. Override the host-side path via the env var to
+      # point at your own agent source projects.
+      - ${HEALTH_AGENT_DIR:-~/projects/health-agent}:/agents/health
+      - ${GEORDI_AGENT_DIR:-~/projects/geordi-agent}:/agents/geordi
+      - ${MARKETING_AGENT_DIR:-~/projects/marketing-agent}:/agents/marketing
+      - ${LINKS_AGENT_DIR:-~/projects/links-agent}:/agents/links
+
+      # Optional: extra read-only context layered into an agent's workdir.
+      # Example shown for marketing — uncomment and set the env var if you
+      # want per-agent reference material that lives outside the source repo.
+      # - ${MARKETING_CONTEXT_DIR}:/agents/marketing/context:ro
+
+      # Geordi's vault — Obsidian-style vault for the geordi agent. Layered
+      # onto /agents/geordi/vault inside the container only.
+      - ${GEORDI_VAULT_DIR:-~/vaults/geordi}:/agents/geordi/vault
+
+      # Links agent's vault destination — agent writes month files into
+      # <vault>/<year>/<month>.md
+      - ${LINKS_VAULT_DIR:-~/vaults/links}:/agents/links/vault
+
+      # planka-cli source — installed into /home/node/planka-venv at startup.
+      # Optional: comment out if you don't use Planka.
+      - ${PLANKA_CLI_DIR:-~/projects/planka-cli}:/opt/planka-cli
+
+      # qmd MCP server — bind-mount the host's whole bun global install so
+      # qmd's hoisted node_modules dependencies (fast-glob, better-sqlite3,
+      # etc.) and the bun.lock marker file the qmd shim uses to pick the bun
+      # runtime are all reachable.
+      - ~/.bun/install/global:/opt/bun-global:ro
+
+      # yt-transcript skill — bind-mount the host script repo so the path
+      # ~/projects/yt-transcript/bin/yt-transcript-safe (referenced by the
+      # skill manifest) resolves inside the container via the host-user
+      # symlink. The script reaches the host's API server via
+      # host.docker.internal (see YT_TRANSCRIPT_API env var and extra_hosts
+      # mapping below). Optional.
+      - ${YT_TRANSCRIPT_DIR:-~/projects/yt-transcript}:/home/node/projects/yt-transcript:ro
+
+      # Hindsight plugin config — points geordi at a hindsight API host
+      # reachable from inside this container. Edit the JSON file to match
+      # your network setup (the host's ~/.hindsight/claude-code.json
+      # typically uses 127.0.0.1, which doesn't resolve from inside a
+      # container).
+      - ./agents/geordi/hindsight-claude-code.json:/home/node/.hindsight/claude-code.json:ro
+
+      # Scrapling MCP server — bind-mount the host's venv and the uv-managed
+      # Python it depends on. The user-level mcp config in ~/.claude.json
+      # references the venv binary by absolute host path. Optional — only
+      # needed if you have scrapling registered as a user-level MCP server.
+      - ~/.local/venvs/scrapling:/home/node/.local/venvs/scrapling:ro
+      - ~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu:/home/node/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu:ro
+
+      # Playwright browser binaries (Chromium, ffmpeg) used by scrapling for
+      # stealth headless browsing. System deps for Chromium are baked into the
+      # image (see Dockerfile).
+      - ~/.cache/ms-playwright:/home/node/.cache/ms-playwright:ro
+    environment:
+      - TERM=xterm-256color
+      # Match the host timezone so cron expressions in heartbeat (e.g.
+      # marketing's "0 5 * * 1-5") fire at local wall-clock time instead
+      # of UTC. Also makes in-container logs, Claude's date, and the
+      # scoring trigger agree with the host.
+      - TZ=${TZ:-America/New_York}
+      - CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+      - DISABLE_NON_ESSENTIAL_MODEL_CALLS=1
+      # yt-transcript skill points the wrapper at the host's loopback API.
+      # host.docker.internal is mapped via extra_hosts below.
+      - YT_TRANSCRIPT_API=${YT_TRANSCRIPT_API:-http://host.docker.internal:8765}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      # Optional: attach to an existing external Docker network so the
+      # container can reach other services on it by name. Comment this out
+      # if you don't have such a network — the homelab-net entry below
+      # must also be commented out then.
+      - homelab-net
+
+# Optional external network. Remove this block if you didn't enable
+# homelab-net under the service above.
+networks:
+  homelab-net:
+    external: true

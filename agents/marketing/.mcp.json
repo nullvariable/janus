@@ -1,0 +1,33 @@
+{
+  "mcpServers": {
+    "mattermost": {
+      "command": "/home/node/.bun/bin/bun",
+      "args": ["/app/mattermost-channel/server.ts"],
+      "env": {
+        "MATTERMOST_URL": "https://your-mattermost-host.example.com",
+        "MATTERMOST_BOT_TOKEN": "REPLACE_WITH_MARKETING_BOT_TOKEN",
+        "MATTERMOST_CHANNEL_ID": "REPLACE_WITH_MARKETING_CHANNEL_ID"
+      }
+    },
+    "heartbeat": {
+      "command": "/home/node/.bun/bin/bun",
+      "args": ["/app/heartbeat/server.ts"],
+      "env": {
+        "HEARTBEAT_FILE": "/agents/marketing/workspace/tasks/create-content.md",
+        "HEARTBEAT_CRON": "0 5 * * 1-5",
+        "HEARTBEAT_LABEL": "create-content",
+        "HEARTBEAT_AUTOPOST": "true",
+        "AUTOPOST_MARKER": "true"
+      }
+    },
+    "heartbeat-keywords": {
+      "command": "/home/node/.bun/bin/bun",
+      "args": ["/app/heartbeat/server.ts"],
+      "env": {
+        "HEARTBEAT_FILE": "/app/agents/marketing/keyword-analysis.md",
+        "HEARTBEAT_CRON": "0 18 * * 0",
+        "HEARTBEAT_LABEL": "keyword-analysis"
+      }
+    }
+  }
+}

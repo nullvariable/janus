@@ -1,0 +1,10 @@
+{
+  "name": "heartbeat",
+  "version": "0.1.0",
+  "description": "Heartbeat MCP server — periodically injects a file's contents into a Claude Code session",
+  "type": "module",
+  "main": "server.ts",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}

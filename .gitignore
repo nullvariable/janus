@@ -1,0 +1,18 @@
+# Agent secrets — .mcp.json files in this repo are committed as templates
+# with placeholder values. Don't commit local .env files (which set real
+# tokens) or any .mcp.json variants that contain real secrets.
+agents/*/.env
+agents/*/.mcp.local.json
+
+# Dependencies
+node_modules/
+mattermost-channel/node_modules/
+
+# Bun
+mattermost-channel/bun.lock
+
+# Claude Code state
+.claude/
+
+# Local environment
+.env
