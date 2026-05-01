@@ -1,5 +1,7 @@
 # Janus
 
+<p align="center"><img src="docs/janus.webp" alt="Janus — Agentic AI" width="360"></p>
+
 > **Personal multi-agent rig.** This is the stack I run for my own AI agents — one Docker container, multiple Claude Code processes side-by-side, shared MCP servers and credentials. It's not a turnkey product. It's documented because the architecture and the gotchas (per-agent MCP denying, plugin install registration, multi-Claude-in-tmux, scheduled prompts via heartbeat) might be useful if you're building something similar.
 
 Multi-agent Docker container running multiple Claude Code instances side-by-side with shared infrastructure. Each agent runs as its own `claude` process in a dedicated tmux window, sharing one container's credentials, MCP servers, plugin marketplace, and bind-mounted host tooling.
