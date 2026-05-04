@@ -1,0 +1,49 @@
+# Hermes config for the links agent.
+#
+# Lives at /app/agents/links/config.yaml in the image; entrypoint.sh symlinks
+# it into the per-agent HERMES_HOME (/agents/links/.hermes/config.yaml) at
+# container start. ${VAR} substitutions resolve from the process env, which
+# inherits from /agents/links/.env (sourced by the launch wrapper before
+# exec'ing `hermes --tui`). See agents/links/.env.example for required vars.
+
+mcp_servers:
+  mattermost:
+    command: "/home/node/.bun/bin/bun"
+    args: ["/app/mattermost-channel/server.ts"]
+    env:
+      MATTERMOST_URL: ${MATTERMOST_URL}
+      MATTERMOST_BOT_TOKEN: ${MATTERMOST_BOT_TOKEN}
+      MATTERMOST_CHANNEL_ID: ${MATTERMOST_CHANNEL_ID}
+      # tmux-inject bridge: when set, mattermost-channel types inbound posts
+      # into the named tmux pane (instead of emitting Claude-Code-only
+      # notifications/claude/channel events). See docs/tui-mcp-bridge.md.
+      MATTERMOST_INJECT_TARGET: "claude-agents:links"
+
+  # Scrapling — primary fetcher for the link archiver. Replaces the CC version's
+  # WebFetch+scrapling combo with a single scrapling-only path; stealthy_fetch
+  # handles JS-heavy / anti-bot sites. Venv is bind-mounted at
+  # /home/node/.local/venvs/scrapling (see docker-compose.yml).
+  scrapling:
+    command: "/home/node/.local/venvs/scrapling/bin/scrapling"
+    args: ["mcp"]
+
+# Backstop hook: after every agent turn, post the response back to Mattermost
+# unless the agent already called mcp_mattermost_{post,reply,react}. Mirrors
+# the CC mattermost-autopost pattern. See docs/tui-mcp-bridge.md.
+hooks:
+  post_llm_call:
+    - command: "/app/hooks/hermes-mattermost-autopost.sh"
+
+model:
+  provider: "ollama-cloud"
+  default: "deepseek-v4-flash"
+
+providers:
+  ollama-cloud:
+    api_key: ${OLLAMA_API_KEY}
+
+display:
+  streaming: true
+  show_cost: true
+
+timezone: "America/New_York"
