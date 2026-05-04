@@ -13,9 +13,7 @@
       "command": "/home/node/.bun/bin/bun",
       "args": ["/app/heartbeat/server.ts"],
       "env": {
-        "HEARTBEAT_FILE": "/agents/geordi/HEARTBEAT.md",
-        "HEARTBEAT_INTERVAL_MINUTES": "30",
-        "HEARTBEAT_JITTER_MINUTES": "2"
+        "HEARTBEAT_CONFIGS_FILE": "/app/agents/geordi/heartbeats.json"
       }
     }
   }

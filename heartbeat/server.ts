@@ -2,25 +2,26 @@
 /**
  * Heartbeat MCP server for Claude Code.
  *
- * Periodically reads a file and injects its contents into the running
- * Claude Code session as a `notifications/claude/channel` event. Useful
- * for scheduled lightweight checks (e.g. due-date polls, status pings)
- * and for cron-style scheduled tasks (e.g. daily content generation).
+ * Periodically reads files and injects their contents into the running
+ * Claude Code session as `notifications/claude/channel` events. One process
+ * manages N schedules, each with its own file and cron/interval settings.
  *
- * Two scheduling modes — set ONE or the other:
+ * Configuration: a JSON file pointed at by HEARTBEAT_CONFIGS_FILE. Schema:
  *
- *   1) Interval + jitter (default):
- *      HEARTBEAT_INTERVAL_MINUTES  base interval, default 30
- *      HEARTBEAT_JITTER_MINUTES    ±n minutes uniform jitter, default 2
+ *   [
+ *     {
+ *       "label": "create-content",                     // unique within file
+ *       "file":  "/agents/marketing/.../create-content.md",
+ *       "cron":  "0 5 * * 1-5",                         // OR interval/jitter (below)
+ *       "interval_minutes": 30,                         // OR cron (above)
+ *       "jitter_minutes": 2,
+ *       "autopost": true,                               // optional, default false
+ *       "marker": true                                  // optional, default false
+ *     },
+ *     ...
+ *   ]
  *
- *   2) Wall-clock cron:
- *      HEARTBEAT_CRON              5-field cron expression, e.g. "0 5 * * 1-5"
- *                                  Supports: *, n, a-b, a,b,c, * /n
- *                                  No L/W/#/? extensions.
- *
- * Common env vars:
- *   HEARTBEAT_FILE   (required) absolute path to file to read
- *   HEARTBEAT_LABEL  source label in inbound meta, default "heartbeat"
+ * Cron parser supports: *, n, a-b, a,b,c, * /n. No L/W/#/? extensions.
  *
  * No tools exposed — heartbeat is one-way. The agent uses other registered
  * channels (e.g. mattermost.reply) to act on what it reads.
@@ -29,37 +30,10 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 
 // ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-const HEARTBEAT_FILE = process.env.HEARTBEAT_FILE
-const CRON = process.env.HEARTBEAT_CRON
-const INTERVAL_MIN = Number(process.env.HEARTBEAT_INTERVAL_MINUTES ?? '30')
-const JITTER_MIN = Number(process.env.HEARTBEAT_JITTER_MINUTES ?? '2')
-const LABEL = process.env.HEARTBEAT_LABEL ?? 'heartbeat'
-
-if (!HEARTBEAT_FILE) {
-  console.error('Missing required HEARTBEAT_FILE env var')
-  process.exit(1)
-}
-
-// In cron mode, interval/jitter are ignored. Otherwise validate them.
-if (!CRON) {
-  if (!Number.isFinite(INTERVAL_MIN) || INTERVAL_MIN <= 0) {
-    console.error(`Invalid HEARTBEAT_INTERVAL_MINUTES: ${process.env.HEARTBEAT_INTERVAL_MINUTES}`)
-    process.exit(1)
-  }
-  if (!Number.isFinite(JITTER_MIN) || JITTER_MIN < 0) {
-    console.error(`Invalid HEARTBEAT_JITTER_MINUTES: ${process.env.HEARTBEAT_JITTER_MINUTES}`)
-    process.exit(1)
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Cron parser — minimal 5-field implementation
+// Schedule type + loader
 // ---------------------------------------------------------------------------
 
 interface CronSpec {
@@ -71,6 +45,44 @@ interface CronSpec {
   domStar: boolean
   dowStar: boolean
 }
+
+interface Schedule {
+  label: string
+  file: string
+  cronExpr?: string
+  cronSpec?: CronSpec
+  intervalMin?: number
+  jitterMin?: number
+  autopost: boolean
+  marker: boolean
+}
+
+const CONFIGS_FILE = process.env.HEARTBEAT_CONFIGS_FILE
+if (!CONFIGS_FILE) {
+  console.error('Missing required HEARTBEAT_CONFIGS_FILE env var')
+  process.exit(1)
+}
+if (!existsSync(CONFIGS_FILE)) {
+  console.error(`HEARTBEAT_CONFIGS_FILE does not exist: ${CONFIGS_FILE}`)
+  process.exit(1)
+}
+
+let raw: unknown
+try {
+  raw = JSON.parse(readFileSync(CONFIGS_FILE, 'utf8'))
+} catch (err) {
+  const msg = err instanceof Error ? err.message : String(err)
+  console.error(`[heartbeat] failed to parse ${CONFIGS_FILE}: ${msg}`)
+  process.exit(1)
+}
+if (!Array.isArray(raw)) {
+  console.error(`[heartbeat] ${CONFIGS_FILE} must contain a JSON array`)
+  process.exit(1)
+}
+
+// ---------------------------------------------------------------------------
+// Cron parser — minimal 5-field implementation
+// ---------------------------------------------------------------------------
 
 function parseField(field: string, min: number, max: number): { values: Set<number>; isStar: boolean } {
   const values = new Set<number>()
@@ -121,9 +133,7 @@ function parseCron(s: string): CronSpec {
 }
 
 // Walk minute-by-minute starting from `from + 1 minute`, return next match.
-// Cron semantics: dom and dow are OR'd unless both are restricted (then AND
-// would be wrong — vixie cron uses OR). We follow vixie: if both are
-// restricted, match if EITHER matches.
+// Cron semantics: dom and dow are OR'd unless both are restricted (vixie).
 function nextCronTick(spec: CronSpec, from: Date): Date {
   const next = new Date(from)
   next.setSeconds(0, 0)
@@ -158,26 +168,98 @@ function nextCronTick(spec: CronSpec, from: Date): Date {
   throw new Error(`no cron match within 1 year for spec`)
 }
 
-let cronSpec: CronSpec | null = null
-if (CRON) {
-  try {
-    cronSpec = parseCron(CRON)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error(`[heartbeat] failed to parse HEARTBEAT_CRON="${CRON}": ${msg}`)
+// ---------------------------------------------------------------------------
+// Validate + normalize each entry
+// ---------------------------------------------------------------------------
+
+const schedules: Schedule[] = []
+const seenLabels = new Set<string>()
+
+for (const [i, entryRaw] of (raw as unknown[]).entries()) {
+  if (!entryRaw || typeof entryRaw !== 'object') {
+    console.error(`[heartbeat] entry ${i}: must be an object`)
     process.exit(1)
   }
+  const entry = entryRaw as Record<string, unknown>
+  const label = entry.label
+  const file = entry.file
+  if (typeof label !== 'string' || !label) {
+    console.error(`[heartbeat] entry ${i}: missing/invalid "label"`)
+    process.exit(1)
+  }
+  if (seenLabels.has(label)) {
+    console.error(`[heartbeat] entry ${i}: duplicate label "${label}"`)
+    process.exit(1)
+  }
+  seenLabels.add(label)
+  if (typeof file !== 'string' || !file) {
+    console.error(`[heartbeat] entry "${label}": missing/invalid "file"`)
+    process.exit(1)
+  }
+  if (!existsSync(file)) {
+    console.error(`[heartbeat] entry "${label}": file does not exist: ${file}`)
+    process.exit(1)
+  }
+
+  const cronExpr = typeof entry.cron === 'string' ? entry.cron : undefined
+  const intervalMin = entry.interval_minutes !== undefined ? Number(entry.interval_minutes) : undefined
+  const jitterMin = entry.jitter_minutes !== undefined ? Number(entry.jitter_minutes) : undefined
+
+  if (cronExpr && intervalMin !== undefined) {
+    console.error(`[heartbeat] entry "${label}": set either "cron" OR "interval_minutes", not both`)
+    process.exit(1)
+  }
+  if (!cronExpr && intervalMin === undefined) {
+    console.error(`[heartbeat] entry "${label}": must set either "cron" or "interval_minutes"`)
+    process.exit(1)
+  }
+
+  let cronSpec: CronSpec | undefined
+  if (cronExpr) {
+    try {
+      cronSpec = parseCron(cronExpr)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error(`[heartbeat] entry "${label}": bad cron "${cronExpr}": ${msg}`)
+      process.exit(1)
+    }
+  } else {
+    if (!Number.isFinite(intervalMin) || (intervalMin as number) <= 0) {
+      console.error(`[heartbeat] entry "${label}": invalid interval_minutes: ${entry.interval_minutes}`)
+      process.exit(1)
+    }
+    if (jitterMin !== undefined && (!Number.isFinite(jitterMin) || jitterMin < 0)) {
+      console.error(`[heartbeat] entry "${label}": invalid jitter_minutes: ${entry.jitter_minutes}`)
+      process.exit(1)
+    }
+  }
+
+  schedules.push({
+    label,
+    file,
+    cronExpr,
+    cronSpec,
+    intervalMin,
+    jitterMin: jitterMin ?? 0,
+    autopost: entry.autopost === true,
+    marker: entry.marker === true,
+  })
+}
+
+if (schedules.length === 0) {
+  console.error(`[heartbeat] ${CONFIGS_FILE} contains no schedules; nothing to do`)
+  process.exit(1)
 }
 
 // ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 
-const INSTRUCTIONS = `Heartbeat events arrive as <channel source="heartbeat" file="..." ts="...">.
-The content IS the prompt — follow the instructions in the file directly. Keep responses lightweight.`
+const INSTRUCTIONS = `Heartbeat events arrive as <channel source="heartbeat" label="..." file="..." ts="...">.
+The "label" attribute identifies which schedule fired; the "file" content IS the prompt — follow the instructions in the file directly. Keep responses lightweight.`
 
 const mcp = new Server(
-  { name: 'heartbeat', version: '0.1.0' },
+  { name: 'heartbeat', version: '0.2.0' },
   {
     capabilities: {
       experimental: {
@@ -196,52 +278,59 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
 await mcp.connect(new StdioServerTransport())
 
 // ---------------------------------------------------------------------------
-// Jittered timer
+// Per-schedule timer chain
 // ---------------------------------------------------------------------------
 
-function nextDelayMs(): { delayMs: number; nextAt: Date } {
-  if (cronSpec) {
-    const nextAt = nextCronTick(cronSpec, new Date())
-    return { delayMs: Math.max(1000, nextAt.getTime() - Date.now()), nextAt }
+function nextDelayMs(s: Schedule): { delayMs: number; nextAt: Date } {
+  if (s.cronSpec) {
+    const nextAt = nextCronTick(s.cronSpec, new Date())
+    // Floor to 60s in cron mode: cron's smallest unit is 1 minute, so any
+    // "next tick is <60s away" is setTimeout drift firing the current tick
+    // a hair early — without this the just-fired minute matches again.
+    return { delayMs: Math.max(60_000, nextAt.getTime() - Date.now()), nextAt }
   }
-  // Uniform jitter in [-JITTER_MIN, +JITTER_MIN]
-  const jitter = (Math.random() * 2 - 1) * JITTER_MIN
-  const minutes = Math.max(0.1, INTERVAL_MIN + jitter)
+  // Uniform jitter in [-jitterMin, +jitterMin]
+  const jitter = (Math.random() * 2 - 1) * (s.jitterMin ?? 0)
+  const minutes = Math.max(0.1, (s.intervalMin as number) + jitter)
   const delayMs = minutes * 60 * 1000
   return { delayMs, nextAt: new Date(Date.now() + delayMs) }
 }
 
-async function tick(): Promise<void> {
+async function tick(s: Schedule): Promise<void> {
   try {
-    const content = readFileSync(HEARTBEAT_FILE!, 'utf8')
+    const content = readFileSync(s.file, 'utf8')
     await mcp.notification({
       method: 'notifications/claude/channel',
       params: {
         content,
         meta: {
-          source: LABEL,
-          file: HEARTBEAT_FILE,
+          source: 'heartbeat',
+          label: s.label,
+          file: s.file,
           ts: new Date().toISOString(),
         },
       },
     })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    console.error(`[heartbeat] tick failed: ${msg}`)
+    console.error(`[heartbeat] tick "${s.label}" failed: ${msg}`)
   }
 }
 
-function schedule(): void {
-  const { delayMs, nextAt } = nextDelayMs()
-  const mode = cronSpec ? `cron="${CRON}"` : `interval=${INTERVAL_MIN}±${JITTER_MIN}min`
+function schedule(s: Schedule): void {
+  const { delayMs, nextAt } = nextDelayMs(s)
+  const mode = s.cronSpec
+    ? `cron="${s.cronExpr}"`
+    : `interval=${s.intervalMin}±${s.jitterMin}min`
   console.error(
-    `[heartbeat] next tick at ${nextAt.toISOString()} (in ${(delayMs / 60000).toFixed(2)} min, ${mode}, file=${HEARTBEAT_FILE})`,
+    `[heartbeat] "${s.label}" next tick at ${nextAt.toISOString()} (in ${(delayMs / 60000).toFixed(2)} min, ${mode}, file=${s.file})`,
   )
   setTimeout(async () => {
-    await tick()
-    schedule()
+    await tick(s)
+    schedule(s)
   }, delayMs)
 }
 
-// First tick is delayed (no startup spam)
-schedule()
+// Start every schedule on its own chain. First tick is delayed (no startup spam).
+console.error(`[heartbeat] loaded ${schedules.length} schedule(s) from ${CONFIGS_FILE}`)
+for (const s of schedules) schedule(s)

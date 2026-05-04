@@ -9,9 +9,10 @@
 #      and (b) the agent didn't call a mattermost tool
 #   4. If both conditions are met, POST the response to mattermost
 #
-# Configuration (read from the agent's .mcp.json heartbeat env block):
-#   HEARTBEAT_AUTOPOST  - "true" to also forward heartbeat-triggered turns
-#   AUTOPOST_MARKER     - "true" to append _(auto-forwarded)_ footer
+# Configuration:
+#   For heartbeat-triggered turns, the per-schedule "autopost" and "marker"
+#   flags come from /app/agents/<name>/heartbeats.json, matched against the
+#   "file" attribute of the inbound <channel> wrapper.
 #
 # Logs every decision to /home/node/.claude/channels/mattermost/autopost.log.
 # Always exits 0 — never blocks the turn.
@@ -85,18 +86,9 @@ if [[ -n "$MM_CHANNEL" ]]; then
   : > "$TYPING_DIR/typing-stop-$MM_CHANNEL" 2>/dev/null || true
 fi
 
-# Read heartbeat config flags
-HB_AUTOPOST=$(python3 -c "
-import json
-d=json.load(open('$MCP_JSON'))
-print(d.get('mcpServers',{}).get('heartbeat',{}).get('env',{}).get('HEARTBEAT_AUTOPOST','false'))
-" 2>/dev/null)
-
-MARKER=$(python3 -c "
-import json
-d=json.load(open('$MCP_JSON'))
-print(d.get('mcpServers',{}).get('heartbeat',{}).get('env',{}).get('AUTOPOST_MARKER','false'))
-" 2>/dev/null)
+# Heartbeat per-schedule autopost/marker flags are resolved after we know
+# which schedule fired (matched by file path against heartbeats.json below).
+HEARTBEATS_JSON="/app/agents/$AGENT/heartbeats.json"
 
 # --- Analyze the transcript ---
 if [[ -z "$TRANSCRIPT_PATH" || ! -f "$TRANSCRIPT_PATH" ]]; then
@@ -141,14 +133,17 @@ if last_user_idx < 0:
     print("no-user-message")
     sys.exit(0)
 
-# Determine source
+# Determine source + file
 source = "terminal"
+hb_file = ""
 if last_user_content.lstrip().startswith("<channel source="):
-    # Extract the source attribute
     import re
     m = re.search(r'source="([^"]+)"', last_user_content)
     if m:
         source = m.group(1)
+    f = re.search(r'file="([^"]+)"', last_user_content)
+    if f:
+        hb_file = f.group(1)
 
 # Walk forward from user message, check for mattermost tool calls
 tool_called = False
@@ -171,12 +166,17 @@ for i in range(last_user_idx + 1, len(lines)):
     if tool_called:
         break
 
-print(f"{source}|{'yes' if tool_called else 'no'}")
+print(f"{source}|{'yes' if tool_called else 'no'}|{hb_file}")
 PYEOF
 )
 
 SOURCE=$(echo "$ANALYSIS" | cut -d'|' -f1)
 TOOL_CALLED=$(echo "$ANALYSIS" | cut -d'|' -f2)
+HB_FILE=$(echo "$ANALYSIS" | cut -d'|' -f3)
+
+# Default heartbeat flags; resolved per-schedule below if applicable.
+MARKER="false"
+LABEL=""
 
 # --- Decision logic ---
 
@@ -186,15 +186,44 @@ if [[ "$SOURCE" == "terminal" || "$SOURCE" == "no-user-message" || "$SOURCE" == 
   exit 0
 fi
 
-# Heartbeat turns → only forward if HEARTBEAT_AUTOPOST is true
-if [[ "$SOURCE" == "heartbeat" && "$HB_AUTOPOST" != "true" ]]; then
-  log "skip-heartbeat-autopost-off source=$SOURCE"
-  exit 0
+# Heartbeat turns → resolve per-schedule autopost/marker by matching file=
+# against agents/<name>/heartbeats.json
+if [[ "$SOURCE" == "heartbeat" ]]; then
+  if [[ -z "$HB_FILE" || ! -f "$HEARTBEATS_JSON" ]]; then
+    log "skip-heartbeat-no-config source=$SOURCE file=$HB_FILE"
+    exit 0
+  fi
+  HB_LOOKUP=$(HB_FILE="$HB_FILE" HEARTBEATS_JSON="$HEARTBEATS_JSON" python3 << 'PYEOF'
+import json, os, sys
+file_path = os.environ.get("HB_FILE","")
+configs_path = os.environ.get("HEARTBEATS_JSON","")
+try:
+    cfg = json.load(open(configs_path))
+except Exception:
+    print("missing||")
+    sys.exit(0)
+match = next((s for s in cfg if s.get("file") == file_path), None)
+if not match:
+    print("missing||")
+    sys.exit(0)
+ap = "true" if match.get("autopost") is True else "false"
+mk = "true" if match.get("marker") is True else "false"
+lbl = match.get("label","")
+print(f"{ap}|{mk}|{lbl}")
+PYEOF
+)
+  HB_AUTOPOST=$(echo "$HB_LOOKUP" | cut -d'|' -f1)
+  MARKER=$(echo "$HB_LOOKUP" | cut -d'|' -f2)
+  LABEL=$(echo "$HB_LOOKUP" | cut -d'|' -f3)
+  if [[ "$HB_AUTOPOST" != "true" ]]; then
+    log "skip-heartbeat-autopost-off source=$SOURCE label=$LABEL file=$HB_FILE"
+    exit 0
+  fi
 fi
 
 # Agent already called a mattermost tool → no action needed
 if [[ "$TOOL_CALLED" == "yes" ]]; then
-  log "skip-tool-called source=$SOURCE"
+  log "skip-tool-called source=$SOURCE label=$LABEL"
   exit 0
 fi
 
@@ -230,9 +259,9 @@ HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
   -d "{\"channel_id\": \"$MM_CHANNEL\", \"message\": $JSON_BODY}" 2>/dev/null || echo "000")
 
 if [[ "$HTTP_CODE" == "201" ]]; then
-  log "posted source=$SOURCE hash=$MSG_HASH http=$HTTP_CODE preview=$(echo "$LAST_MSG" | head -c 80)"
+  log "posted source=$SOURCE label=$LABEL hash=$MSG_HASH http=$HTTP_CODE preview=$(echo "$LAST_MSG" | head -c 80)"
 else
-  log "error-http source=$SOURCE hash=$MSG_HASH http=$HTTP_CODE"
+  log "error-http source=$SOURCE label=$LABEL hash=$MSG_HASH http=$HTTP_CODE"
 fi
 
 exit 0

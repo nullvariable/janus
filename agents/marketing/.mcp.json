@@ -13,20 +13,7 @@
       "command": "/home/node/.bun/bin/bun",
       "args": ["/app/heartbeat/server.ts"],
       "env": {
-        "HEARTBEAT_FILE": "/agents/marketing/workspace/tasks/create-content.md",
-        "HEARTBEAT_CRON": "0 5 * * 1-5",
-        "HEARTBEAT_LABEL": "create-content",
-        "HEARTBEAT_AUTOPOST": "true",
-        "AUTOPOST_MARKER": "true"
-      }
-    },
-    "heartbeat-keywords": {
-      "command": "/home/node/.bun/bin/bun",
-      "args": ["/app/heartbeat/server.ts"],
-      "env": {
-        "HEARTBEAT_FILE": "/app/agents/marketing/keyword-analysis.md",
-        "HEARTBEAT_CRON": "0 18 * * 0",
-        "HEARTBEAT_LABEL": "keyword-analysis"
+        "HEARTBEAT_CONFIGS_FILE": "/app/agents/marketing/heartbeats.json"
       }
     }
   }

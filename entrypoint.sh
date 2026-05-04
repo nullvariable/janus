@@ -62,7 +62,7 @@ declare -A KIND=(
 declare -A CHANNELS=(
   [health]="server:mattermost"
   [geordi]="server:mattermost server:heartbeat"
-  [marketing]="server:mattermost server:heartbeat server:heartbeat-keywords"
+  [marketing]="server:mattermost server:heartbeat"
   [links]="server:mattermost"
 )
 

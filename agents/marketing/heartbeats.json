@@ -1,0 +1,15 @@
+[
+  {
+    "label": "create-content",
+    "file": "/agents/marketing/workspace/tasks/create-content.md",
+    "cron": "0 5 * * 1-5",
+    "autopost": true,
+    "marker": true
+  },
+  {
+    "label": "keyword-analysis",
+    "file": "/app/agents/marketing/keyword-analysis.md",
+    "cron": "0 18 * * 0",
+    "autopost": true
+  }
+]

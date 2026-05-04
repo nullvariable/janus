@@ -149,37 +149,43 @@ Empty by default; add `[<agent>]="<model-id>"` to pin a non-default Claude model
 
 ### Heartbeat MCP server
 
-`heartbeat/` injects a file's contents into a CC agent's session on a schedule. Two modes:
-
-**Interval + jitter** — drift across restarts, no wall-clock alignment. Used by geordi for ~30 min lightweight checks.
+`heartbeat/` injects file contents into a CC agent's session on a schedule. One MCP process per agent runs N schedules, declared in a JSON file pointed at by `HEARTBEAT_CONFIGS_FILE`.
 
 ```json
 "heartbeat": {
   "command": "/home/node/.bun/bin/bun",
   "args": ["/app/heartbeat/server.ts"],
   "env": {
-    "HEARTBEAT_FILE": "/agents/<name>/HEARTBEAT.md",
-    "HEARTBEAT_INTERVAL_MINUTES": "30",
-    "HEARTBEAT_JITTER_MINUTES": "2"
+    "HEARTBEAT_CONFIGS_FILE": "/app/agents/<name>/heartbeats.json"
   }
 }
 ```
 
-**Cron** — wall-clock aligned. Used by marketing for the 5am M–F content run.
+Schedules file (`agents/<name>/heartbeats.json`):
 
 ```json
-"heartbeat": {
-  "command": "/home/node/.bun/bin/bun",
-  "args": ["/app/heartbeat/server.ts"],
-  "env": {
-    "HEARTBEAT_FILE": "/agents/<name>/workspace/tasks/create-content.md",
-    "HEARTBEAT_CRON": "0 5 * * 1-5",
-    "HEARTBEAT_LABEL": "create-content"
+[
+  {
+    "label": "create-content",
+    "file":  "/agents/marketing/workspace/tasks/create-content.md",
+    "cron":  "0 5 * * 1-5",
+    "autopost": true,
+    "marker":   true
+  },
+  {
+    "label": "geordi",
+    "file":  "/agents/geordi/HEARTBEAT.md",
+    "interval_minutes": 30,
+    "jitter_minutes":    2
   }
-}
+]
 ```
 
-5-field cron with `*`, ranges, lists, and `*/n` steps. No `L`/`W`/`#`/`?` extensions. dom + dow are OR'd vixie-style when both are restricted.
+Each entry is one schedule. Set **either** `cron` (wall-clock aligned) **or** `interval_minutes` + `jitter_minutes` (drift across restarts). 5-field cron with `*`, ranges, lists, and `*/n` steps. No `L`/`W`/`#`/`?` extensions. dom + dow are OR'd vixie-style when both are restricted.
+
+Each tick emits `<channel source="heartbeat" label="..." file="..." ts="...">` containing the file's content; the file content IS the prompt. `label` identifies which schedule fired.
+
+The optional `autopost` / `marker` flags are read by `hooks/mattermost-autopost.sh`: `autopost` lets a heartbeat-triggered turn forward its assistant response to Mattermost (otherwise heartbeat turns stay silent); `marker` appends `_(auto-forwarded)_` when the hook does. Per-schedule, not per-agent.
 
 ### Mattermost MCP tools
 
