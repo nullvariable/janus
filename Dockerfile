@@ -8,6 +8,7 @@ FROM node:22-slim
 #   at a non-standard path so we want a system /usr/bin/python3 in PATH)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tmux curl unzip ca-certificates git python3 poppler-utils \
+        ripgrep ffmpeg \
         libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
         libcups2 libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 \
         libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
@@ -24,11 +25,40 @@ RUN npm install -g @anthropic-ai/claude-code
 ARG HOST_USER=hostuser
 RUN ln -sf /home/node /home/${HOST_USER}
 
+# GitHub CLI from the official GitHub apt repo (Debian's gh is too old for
+# agents that query PRs/issues). Installed as root before the USER node switch.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod 644 /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # Install Bun and uv as the node user (UID 1000, matches typical host file ownership)
 USER node
 RUN curl -fsSL https://bun.sh/install | bash
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/home/node/.bun/bin:/home/node/.local/bin:/home/node/planka-venv/bin:$PATH"
+
+# Install Hermes (Nous Research's autonomous agent runtime). The installer
+# drops code at /home/node/.hermes/hermes-agent/ and a CLI symlink at
+# /home/node/.local/bin/hermes (already on PATH). --skip-setup avoids the
+# post-install wizard — config is provided per-agent via mcp_servers in
+# agents/<name>/config.yaml.
+#
+# Download to a file before executing so curl failures fail the RUN cleanly
+# (avoids the curl|bash pipefail trap). The install path is kept at the
+# default /home/node/.hermes/hermes-agent/ because the installer bakes that
+# absolute path into the venv's python shebangs — moving the directory would
+# break every entry point. Per-agent HERMES_HOMEs (set by entrypoint.sh)
+# bind-mount under /agents/<name>/.hermes and symlink hermes-agent back to
+# /home/node/.hermes/hermes-agent for runtime code resolution.
+RUN set -eux; \
+    curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
+         -o /tmp/hermes-install.sh; \
+    bash /tmp/hermes-install.sh --skip-setup; \
+    rm /tmp/hermes-install.sh
 
 # qmd wrapper at the path the user-level mcp config in ~/.claude.json
 # expects (resolved via /home/${HOST_USER} -> /home/node symlink).

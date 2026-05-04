@@ -19,6 +19,13 @@ services:
       # Mattermost channel state (access.json, .env fallback)
       - ${MATTERMOST_STATE_DIR:-~/.claude/channels/mattermost}:/home/node/.claude/channels/mattermost
 
+      # gh CLI auth source — bind-mounted read-only at a staging path; the
+      # entrypoint copies it to ~/.config/gh so the container's newer gh can
+      # migrate/write its config without touching the host file. Optional —
+      # only needed if any agent uses gh. Comment out if you don't have
+      # ~/.config/gh on the host.
+      - ${GH_CONFIG_DIR:-~/.config/gh}:/host-gh:ro
+
       # Agent project directories. Each agent's source repo is bind-mounted
       # at /agents/<name>. Override the host-side path via the env var to
       # point at your own agent source projects.

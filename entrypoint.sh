@@ -9,6 +9,17 @@
 SESSION="claude-agents"
 CLAUDE_BASE="claude --dangerously-skip-permissions"
 
+# Stage gh CLI auth from the read-only host bind-mount into a writable
+# location. The container's gh is newer than the host's and may migrate the
+# hosts.yml format on first run — doing that against the host file directly
+# would break the host's older gh, so we copy.
+if [[ -d /host-gh ]]; then
+  mkdir -p /home/node/.config/gh
+  cp -r /host-gh/. /home/node/.config/gh/
+  chmod 700 /home/node/.config/gh
+  chmod 600 /home/node/.config/gh/*.yml 2>/dev/null || true
+fi
+
 # Install planka-cli into the venv (idempotent — skips if already installed)
 if [[ -d /opt/planka-cli ]] && ! /home/node/planka-venv/bin/planka-cli --help &>/dev/null; then
   echo "[entrypoint] Installing planka-cli into venv..."
@@ -39,9 +50,15 @@ declare -A AGENTS=(
   [links]=/agents/links
 )
 
+# Per-agent runtime: 'claude' (Claude Code) or 'hermes' (Nous Research Hermes).
+# Defaults to 'claude' if unset.
+declare -A KIND=(
+  [links]=hermes
+)
+
 # Per-agent channel list (space-separated server:<name>). Each entry produces
 # one --dangerously-load-development-channels flag. Channels listed here MUST
-# be registered in the agent's .mcp.json.
+# be registered in the agent's .mcp.json. Ignored for hermes agents.
 declare -A CHANNELS=(
   [health]="server:mattermost"
   [geordi]="server:mattermost server:heartbeat"
@@ -49,10 +66,9 @@ declare -A CHANNELS=(
   [links]="server:mattermost"
 )
 
-# Per-agent model override. Empty/unset means use the default model.
-# Pinned to Haiku for cheap, high-volume link archiving.
+# Per-agent model override (Claude Code only). Empty/unset means use the
+# default model. Hermes agents pin their model in config.yaml instead.
 declare -A MODELS=(
-  [links]="claude-haiku-4-5-20251001"
 )
 
 # Ordered list (bash associative arrays don't preserve order)
@@ -71,8 +87,28 @@ build_claude_cmd() {
   echo "$cmd"
 }
 
+# Build the launch command for a hermes agent. Config and MCP servers are
+# loaded from $HERMES_HOME/config.yaml (symlinked into place by setup_agent).
+# --accept-hooks pre-approves shell hooks declared in config.yaml so the TUI
+# doesn't block on a first-use TTY consent prompt (we run unattended).
+build_hermes_cmd() {
+  local name="$1"
+  local workdir="${AGENTS[$name]}"
+  echo "HERMES_HOME=$workdir/.hermes hermes --tui --accept-hooks"
+}
+
+# Dispatch to the right command builder based on KIND[name].
+build_agent_cmd() {
+  local name="$1"
+  case "${KIND[$name]:-claude}" in
+    hermes) build_hermes_cmd "$name" ;;
+    *)      build_claude_cmd "$name" ;;
+  esac
+}
+
 # Auto-accept startup prompts (workspace trust, dev channels confirmation).
-# Targets a specific tmux window by name.
+# Targets a specific tmux window by name. Claude Code only — Hermes has no
+# equivalent first-run prompts.
 accept_startup_prompts() {
   local window="$1"
   (
@@ -83,13 +119,24 @@ accept_startup_prompts() {
   ) &
 }
 
-# Symlink .mcp.json from /app/agents/<name>/ into the agent's workdir
+# Stage per-agent runtime config into the bind-mounted workdir. For Claude
+# Code agents that's a .mcp.json symlink; for Hermes agents it's a config.yaml
+# symlink plus a hermes-agent code symlink (required because the venv's python
+# shebangs hardcode /home/node/.hermes/hermes-agent).
 setup_agent() {
   local name="$1"
   local workdir="${AGENTS[$name]}"
 
-  # Symlink .mcp.json into the bind-mounted project directory
-  ln -sf "/app/agents/$name/.mcp.json" "$workdir/.mcp.json"
+  case "${KIND[$name]:-claude}" in
+    hermes)
+      mkdir -p "$workdir/.hermes"
+      ln -sfn /home/node/.hermes/hermes-agent "$workdir/.hermes/hermes-agent"
+      ln -sf "/app/agents/$name/config.yaml" "$workdir/.hermes/config.yaml"
+      ;;
+    *)
+      ln -sf "/app/agents/$name/.mcp.json" "$workdir/.mcp.json"
+      ;;
+  esac
 
   # Source agent-specific env vars if .env exists
   if [[ -f "/app/agents/$name/.env" ]]; then
@@ -106,22 +153,31 @@ start_session() {
   for name in "${AGENT_ORDER[@]}"; do
     local workdir="${AGENTS[$name]}"
     local cmd
-    cmd=$(build_claude_cmd "$name")
     setup_agent "$name"
+    cmd=$(build_agent_cmd "$name")
+
+    # Wrap the launch command so each window sources its own .env. tmux
+    # windows inherit the tmux server's env (frozen at server start), so
+    # vars sourced later by setup_agent never reach later windows. Sourcing
+    # inside the per-window shell ensures every agent process gets its own
+    # secrets (e.g. for ${...} substitution in .mcp.json / config.yaml).
+    local launch="cd $workdir && [ -f .env ] && { set -a; . ./.env; set +a; }; $cmd"
 
     if $first; then
       # Create the tmux session with the first agent
       tmux new-session -d -s "$SESSION" -n "$name" -x 200 -y 50 \
-        "cd $workdir && $cmd"
+        "$launch"
       first=false
     else
       # Add a new window for subsequent agents
       tmux new-window -t "$SESSION" -n "$name" \
-        "cd $workdir && $cmd"
+        "$launch"
     fi
 
     tmux set-option -t "$SESSION:$name" remain-on-exit on 2>/dev/null || true
-    accept_startup_prompts "$name"
+    if [[ "${KIND[$name]:-claude}" == "claude" ]]; then
+      accept_startup_prompts "$name"
+    fi
   done
 }
 
@@ -146,9 +202,12 @@ while true; do
       echo "[entrypoint] $name exited, respawning in 5s..."
       sleep 5
       setup_agent "$name"
-      cmd=$(build_claude_cmd "$name")
-      tmux respawn-pane -t "$SESSION:$name" "cd $workdir && $cmd" 2>/dev/null || true
-      accept_startup_prompts "$name"
+      cmd=$(build_agent_cmd "$name")
+      launch="cd $workdir && [ -f .env ] && { set -a; . ./.env; set +a; }; $cmd"
+      tmux respawn-pane -t "$SESSION:$name" "$launch" 2>/dev/null || true
+      if [[ "${KIND[$name]:-claude}" == "claude" ]]; then
+        accept_startup_prompts "$name"
+      fi
     fi
   done
 done
