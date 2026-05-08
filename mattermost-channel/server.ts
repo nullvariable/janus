@@ -25,6 +25,9 @@ import { homedir } from 'node:os'
 
 import { MattermostClient } from './mattermost.js'
 import { loadAccess, isAllowed } from './access.js'
+import { initSentry, captureException } from './sentry.js'
+
+initSentry('mattermost-channel')
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -399,6 +402,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       broadcastStopTyping(channel_id)
       return { content: [{ type: 'text' as const, text: 'sent' }] }
     } catch (err) {
+      captureException(err, { mcp_tool: 'reply' })
       const msg = err instanceof Error ? err.message : String(err)
       return { content: [{ type: 'text' as const, text: `error: ${msg}` }], isError: true }
     }
@@ -412,6 +416,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       broadcastStopTyping(MATTERMOST_CHANNEL_ID)
       return { content: [{ type: 'text' as const, text: `sent to ${MATTERMOST_CHANNEL_ID}` }] }
     } catch (err) {
+      captureException(err, { mcp_tool: 'post' })
       const msg = err instanceof Error ? err.message : String(err)
       return { content: [{ type: 'text' as const, text: `error: ${msg}` }], isError: true }
     }
@@ -436,6 +441,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       broadcastStopTyping(MATTERMOST_CHANNEL_ID)
       return { content: [{ type: 'text' as const, text: 'reacted' }] }
     } catch (err) {
+      captureException(err, { mcp_tool: 'react' })
       const msg = err instanceof Error ? err.message : String(err)
       return { content: [{ type: 'text' as const, text: `error: ${msg}` }], isError: true }
     }
