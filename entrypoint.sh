@@ -9,6 +9,28 @@
 SESSION="claude-agents"
 CLAUDE_BASE="claude --dangerously-skip-permissions"
 
+# Crash reporter — if scripts/report-crash.sh is present, source it so the
+# respawn loop can ship a Sentry/GlitchTip event for each pane death. The
+# function is a no-op when no GLITCHTIP_DSN_<AGENT> env var is set, so this
+# is safe even without an error tracker configured.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/scripts/report-crash.sh" ]]; then
+  # shellcheck source=scripts/report-crash.sh
+  source "$SCRIPT_DIR/scripts/report-crash.sh"
+else
+  report_crash() { :; }
+fi
+
+# Source the top-level .env if present so per-agent GLITCHTIP_DSN_<AGENT>
+# vars are visible to report_crash. Per-agent .env files are still sourced
+# separately for per-window var injection.
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/.env"
+  set +a
+fi
+
 # Stage gh CLI auth from the read-only host bind-mount into a writable
 # location. The container's gh is newer than the host's and may migrate the
 # hosts.yml format on first run — doing that against the host file directly
@@ -197,7 +219,12 @@ while true; do
 
     # Check if this window's pane has exited
     if tmux list-panes -t "$SESSION:$name" -F '#{pane_dead}' 2>/dev/null | grep -q '^1$'; then
-      echo "[entrypoint] $name exited, respawning in 5s..."
+      # Capture exit code + tail of pane output BEFORE respawn so the report
+      # describes the dead state, not the new one.
+      exit_code=$(tmux display-message -p -t "$SESSION:$name" '#{pane_dead_status}' 2>/dev/null || echo "?")
+      tail_output=$(tmux capture-pane -t "$SESSION:$name" -p -S -50 2>/dev/null | tail -50)
+      echo "[entrypoint] $name exited (exit=$exit_code), respawning in 5s..."
+      report_crash "$name" "$exit_code" "$tail_output"
       sleep 5
       setup_agent "$name"
       cmd=$(build_agent_cmd "$name")

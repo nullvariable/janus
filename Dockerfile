@@ -79,14 +79,19 @@ RUN cd mattermost-channel && bun install --frozen-lockfile || bun install
 COPY --chown=node:node heartbeat/package.json heartbeat/bun.lock* ./heartbeat/
 RUN cd heartbeat && bun install --frozen-lockfile || bun install
 
+COPY --chown=node:node planka-channel/package.json planka-channel/bun.lock* ./planka-channel/
+RUN cd planka-channel && bun install --frozen-lockfile || bun install
+
 COPY --chown=node:node mattermost-channel/ ./mattermost-channel/
 COPY --chown=node:node heartbeat/ ./heartbeat/
+COPY --chown=node:node planka-channel/ ./planka-channel/
 
-# Copy agent configs, hooks, and entrypoint
+# Copy agent configs, hooks, scripts, and entrypoint
 COPY --chown=node:node agents/ ./agents/
 COPY --chown=node:node hooks/ ./hooks/
+COPY --chown=node:node scripts/ ./scripts/
 COPY --chown=node:node entrypoint.sh ./
-RUN chmod +x entrypoint.sh hooks/*.sh
+RUN chmod +x entrypoint.sh hooks/*.sh scripts/*.sh
 # Symlink hooks at the host-style path so settings.local.json can use one path
 # that works both on the host and inside the container (via the existing
 # /home/${HOST_USER} -> /home/node symlink).

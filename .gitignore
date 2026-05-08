@@ -7,9 +7,13 @@ agents/*/.mcp.local.json
 # Dependencies
 node_modules/
 mattermost-channel/node_modules/
+heartbeat/node_modules/
+planka-channel/node_modules/
 
 # Bun
 mattermost-channel/bun.lock
+heartbeat/bun.lock
+planka-channel/bun.lock
 
 # Claude Code state
 .claude/
