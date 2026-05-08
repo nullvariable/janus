@@ -4,6 +4,8 @@
  * a REST method to post messages back.
  */
 
+import { captureApiError, captureException } from './sentry.js'
+
 export interface MattermostPost {
   id: string
   channel_id: string
@@ -55,11 +57,14 @@ export class MattermostClient {
 
   /** Fetch the bot's own user ID to filter echo messages. */
   async fetchBotUserId(): Promise<string> {
-    const res = await fetch(`${this.url}/api/v4/users/me`, {
+    const url = `${this.url}/api/v4/users/me`
+    const res = await fetch(url, {
       headers: { Authorization: `Bearer ${this.token}` },
     })
     if (!res.ok) {
-      throw new Error(`Failed to fetch bot user: ${res.status} ${await res.text()}`)
+      const body = await res.text()
+      void captureApiError(url, res.status, body, { endpoint: 'users/me' })
+      throw new Error(`Failed to fetch bot user: ${res.status} ${body}`)
     }
     const user = (await res.json()) as { id: string }
     this.botUserId = user.id
@@ -86,7 +91,8 @@ export class MattermostClient {
 
   /** Post a message to a Mattermost channel. */
   async postMessage(channelId: string, message: string): Promise<void> {
-    const res = await fetch(`${this.url}/api/v4/posts`, {
+    const url = `${this.url}/api/v4/posts`
+    const res = await fetch(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.token}`,
@@ -96,6 +102,7 @@ export class MattermostClient {
     })
     if (!res.ok) {
       const text = await res.text()
+      void captureApiError(url, res.status, text, { endpoint: 'posts', channel_id: channelId })
       throw new Error(`Failed to post message: ${res.status} ${text}`)
     }
   }
@@ -103,7 +110,8 @@ export class MattermostClient {
   /** Add an emoji reaction to a post. */
   async addReaction(postId: string, emojiName: string): Promise<void> {
     if (!this.botUserId) await this.fetchBotUserId()
-    const res = await fetch(`${this.url}/api/v4/reactions`, {
+    const url = `${this.url}/api/v4/reactions`
+    const res = await fetch(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.token}`,
@@ -117,6 +125,7 @@ export class MattermostClient {
     })
     if (!res.ok) {
       const text = await res.text()
+      void captureApiError(url, res.status, text, { endpoint: 'reactions', post_id: postId })
       throw new Error(`Failed to add reaction: ${res.status} ${text}`)
     }
   }
@@ -172,8 +181,11 @@ export class MattermostClient {
       }
     }
 
-    ws.onerror = () => {
-      // onclose fires after onerror, so reconnect is handled there
+    ws.onerror = (event) => {
+      // onclose fires after onerror, so reconnect is handled there.
+      // Report the error to GlitchTip so persistent WS issues are visible.
+      const err = (event as ErrorEvent)?.error ?? new Error(`WebSocket error on ${wsUrl}`)
+      captureException(err, { ws_url: wsUrl })
     }
   }
 

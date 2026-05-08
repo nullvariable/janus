@@ -35,6 +35,30 @@ Per-agent, in the agent's `.mcp.json`:
 
 `PLANKA_BOARD_ID` is the per-agent isolator — one board per MCP process. To run a second agent on a second board, give it a different `PLANKA_WEBHOOK_PORT` and a different webhook in Planka.
 
+### Multi-board agents
+
+For an agent that watches more than one board, use plural form plus an explicit instance name:
+
+```
+PLANKA_BOARD_IDS=B1,B2,B3
+PLANKA_INSTANCE_NAME=myagent
+```
+
+`PLANKA_INSTANCE_NAME` is the state-dir label (state lives at `${PLANKA_STATE_DIR}/<instance>/`) and the Stop-hook marker filename. It's required when watching more than one board; for single-board agents it defaults to the board id (preserving today's path).
+
+Register one webhook per board in Planka, all pointing at the same URL (`http://<container>:<port>/webhook`) with the same `accessToken`. The server filters incoming events by checking each event's `boardId` against the `PLANKA_BOARD_IDS` set, so events from other boards are silently dropped. Card events stay scoped to one bundle per card; cards from different boards just get different bundles.
+
+Bundles, audit rows, and channel notifications all carry the actual event's `board_id`, not a fixed value, so the agent can tell which board a bundle came from.
+
+### Auth: token vs. password
+
+Two auth modes are supported:
+
+- **`PLANKA_TOKEN`** (preferred): a Bearer token (Planka access token JWT or a user API key). The server sniffs JWT vs. opaque key and uses `Authorization: Bearer …` or `x-api-key: …` accordingly. No login round-trip on startup.
+- **`PLANKA_USERNAME` + `PLANKA_PASSWORD`**: classic login flow that mints a JWT via `POST /api/access-tokens`. The server auto-refreshes on 401.
+
+If you authenticate as a SHARED admin user but need event-filtering scoped to a different bot identity, set `PLANKA_BOT_USER_ID` to override what `/api/users/me` returns.
+
 ## Webhook registration in Planka
 
 Each agent needs one webhook configured in Planka pointing at this server. Either via the Planka UI or `POST /api/webhooks` with:

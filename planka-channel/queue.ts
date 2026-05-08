@@ -59,6 +59,7 @@ export interface BundleEvent {
 
 export interface PendingBundle {
   bundle_id: string
+  board_id: string | null
   card_id: string | null
   card_name: string | null
   card_url: string | null
@@ -94,8 +95,14 @@ export class Queue {
   private pending: PendingBundle[] = []
   private pushDelayMs: number
 
-  constructor(stateDir: string, boardId: string, pushDelayMs = DEFAULT_PUSH_DELAY_MS) {
-    this.dir = join(stateDir, boardId)
+  /**
+   * `instanceName` is the per-agent state-dir label. For single-board agents,
+   * pass the board id — keeps the existing path `${stateDir}/<board_id>/`.
+   * For multi-board agents (one agent watching several boards), pass a short
+   * agent label so all boards share one state file.
+   */
+  constructor(stateDir: string, instanceName: string, pushDelayMs = DEFAULT_PUSH_DELAY_MS) {
+    this.dir = join(stateDir, instanceName)
     mkdirSync(this.dir, { recursive: true })
     this.statePath = join(this.dir, 'state.json')
     this.queuePath = join(this.dir, 'queue.jsonl')
@@ -204,9 +211,11 @@ export class Queue {
       // Refresh card-level metadata when we learn it from later events
       if (env.card_name && !target.card_name) target.card_name = env.card_name
       if (env.card_url && !target.card_url) target.card_url = env.card_url
+      if (env.board_id && !target.board_id) target.board_id = env.board_id
     } else {
       this.pending.push({
         bundle_id: newEventId(),
+        board_id: env.board_id || null,
         card_id: env.card_id,
         card_name: env.card_name,
         card_url: env.card_url,
@@ -379,6 +388,7 @@ export class Queue {
       JSON.stringify({
         ts: new Date().toISOString(),
         priority: opts.priority ?? 'none',
+        board_id: b.board_id,
         card_id: b.card_id,
         card_url: b.card_url,
         bundle_id: b.bundle_id,
@@ -412,7 +422,7 @@ export function newEventId(): string {
 }
 
 /** Render a bundle as the channel-notification body the agent sees. */
-export function narrateBundle(bundle: PendingBundle, boardId: string): string {
+export function narrateBundle(bundle: PendingBundle): string {
   const cardLabel = bundle.card_name ? `"${bundle.card_name}"` : `card ${bundle.card_id ?? '(unknown)'}`
   const header = bundle.events.length === 1
     ? `1 event on ${cardLabel}:`
@@ -424,7 +434,7 @@ export function narrateBundle(bundle: PendingBundle, boardId: string): string {
   })
   const meta = [
     `source="planka"`,
-    `board_id="${boardId}"`,
+    `board_id="${bundle.board_id ?? ''}"`,
     `bundle_id="${bundle.bundle_id}"`,
     `card_id="${bundle.card_id ?? ''}"`,
     `event_count="${bundle.events.length}"`,
