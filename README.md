@@ -107,7 +107,7 @@ The architecture details are in [`docs/tui-mcp-bridge.md`](docs/tui-mcp-bridge.m
 | `~/projects/links-agent` | `/agents/links` | links agent source project |
 | `~/vaults/geordi` | `/agents/geordi/vault` | Obsidian-style vault for geordi |
 | `~/vaults/links` | `/agents/links/vault` | Obsidian `links/` folder |
-| `~/projects/planka-cli` | `/opt/planka-cli` | planka-cli source (editable install at startup) |
+| `~/projects/plnk/target/release/plnk` | `/usr/local/bin/plnk:ro` | plnk Rust binary (replaces planka-cli) |
 | `~/.local/venvs/scrapling` (+ uv-managed Python) | same paths | scrapling venv + interpreter |
 | `~/.bun/install/global` | `/opt/bun-global` | host bun globals (qmd + hoisted node_modules) |
 | `~/.cache/ms-playwright` | `/home/node/.cache/ms-playwright` | Chromium binaries for scrapling |

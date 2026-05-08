@@ -39,7 +39,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 USER node
 RUN curl -fsSL https://bun.sh/install | bash
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/home/node/.bun/bin:/home/node/.local/bin:/home/node/planka-venv/bin:$PATH"
+ENV PATH="/home/node/.bun/bin:/home/node/.local/bin:$PATH"
 
 # Install Hermes (Nous Research's autonomous agent runtime). The installer
 # drops code at /home/node/.hermes/hermes-agent/ and a CLI symlink at
@@ -71,10 +71,6 @@ RUN printf '%s\n' '#!/bin/sh' \
     'exec /home/node/.bun/bin/bun /opt/bun-global/node_modules/@tobilu/qmd/dist/cli/qmd.js "$@"' \
     > /home/node/.bun/bin/qmd && chmod +x /home/node/.bun/bin/qmd
 
-# Create empty venv for planka-cli with Python 3.13 (uv downloads if needed).
-# planka-cli is installed into this venv at runtime from bind-mounted source.
-RUN /home/node/.local/bin/uv venv --python 3.13 /home/node/planka-venv
-
 # Copy MCP servers and install dependencies (layer-cached)
 WORKDIR /app
 COPY --chown=node:node mattermost-channel/package.json mattermost-channel/bun.lock* ./mattermost-channel/
@@ -83,14 +79,19 @@ RUN cd mattermost-channel && bun install --frozen-lockfile || bun install
 COPY --chown=node:node heartbeat/package.json heartbeat/bun.lock* ./heartbeat/
 RUN cd heartbeat && bun install --frozen-lockfile || bun install
 
+COPY --chown=node:node planka-channel/package.json planka-channel/bun.lock* ./planka-channel/
+RUN cd planka-channel && bun install --frozen-lockfile || bun install
+
 COPY --chown=node:node mattermost-channel/ ./mattermost-channel/
 COPY --chown=node:node heartbeat/ ./heartbeat/
+COPY --chown=node:node planka-channel/ ./planka-channel/
 
-# Copy agent configs, hooks, and entrypoint
+# Copy agent configs, hooks, scripts, and entrypoint
 COPY --chown=node:node agents/ ./agents/
 COPY --chown=node:node hooks/ ./hooks/
+COPY --chown=node:node scripts/ ./scripts/
 COPY --chown=node:node entrypoint.sh ./
-RUN chmod +x entrypoint.sh hooks/*.sh
+RUN chmod +x entrypoint.sh hooks/*.sh scripts/*.sh
 # Symlink hooks at the host-style path so settings.local.json can use one path
 # that works both on the host and inside the container (via the existing
 # /home/${HOST_USER} -> /home/node symlink).

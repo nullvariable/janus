@@ -31,6 +31,14 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { existsSync, readFileSync } from 'node:fs'
+import { initSentry, captureException, fatalAndExit } from './sentry.js'
+
+initSentry('heartbeat')
+
+async function fatal(msg: string, tags?: Record<string, string>): Promise<never> {
+  console.error(msg)
+  return fatalAndExit(msg, tags)
+}
 
 // ---------------------------------------------------------------------------
 // Schedule type + loader
@@ -59,12 +67,10 @@ interface Schedule {
 
 const CONFIGS_FILE = process.env.HEARTBEAT_CONFIGS_FILE
 if (!CONFIGS_FILE) {
-  console.error('Missing required HEARTBEAT_CONFIGS_FILE env var')
-  process.exit(1)
+  await fatal('Missing required HEARTBEAT_CONFIGS_FILE env var', { reason: 'missing_env' })
 }
 if (!existsSync(CONFIGS_FILE)) {
-  console.error(`HEARTBEAT_CONFIGS_FILE does not exist: ${CONFIGS_FILE}`)
-  process.exit(1)
+  await fatal(`HEARTBEAT_CONFIGS_FILE does not exist: ${CONFIGS_FILE}`, { reason: 'missing_file' })
 }
 
 let raw: unknown
@@ -72,12 +78,10 @@ try {
   raw = JSON.parse(readFileSync(CONFIGS_FILE, 'utf8'))
 } catch (err) {
   const msg = err instanceof Error ? err.message : String(err)
-  console.error(`[heartbeat] failed to parse ${CONFIGS_FILE}: ${msg}`)
-  process.exit(1)
+  await fatal(`[heartbeat] failed to parse ${CONFIGS_FILE}: ${msg}`, { reason: 'parse_failed' })
 }
 if (!Array.isArray(raw)) {
-  console.error(`[heartbeat] ${CONFIGS_FILE} must contain a JSON array`)
-  process.exit(1)
+  await fatal(`[heartbeat] ${CONFIGS_FILE} must contain a JSON array`, { reason: 'bad_format' })
 }
 
 // ---------------------------------------------------------------------------
@@ -177,28 +181,23 @@ const seenLabels = new Set<string>()
 
 for (const [i, entryRaw] of (raw as unknown[]).entries()) {
   if (!entryRaw || typeof entryRaw !== 'object') {
-    console.error(`[heartbeat] entry ${i}: must be an object`)
-    process.exit(1)
+    await fatal(`[heartbeat] entry ${i}: must be an object`, { reason: 'bad_entry' })
   }
   const entry = entryRaw as Record<string, unknown>
   const label = entry.label
   const file = entry.file
   if (typeof label !== 'string' || !label) {
-    console.error(`[heartbeat] entry ${i}: missing/invalid "label"`)
-    process.exit(1)
+    await fatal(`[heartbeat] entry ${i}: missing/invalid "label"`, { reason: 'bad_label' })
   }
-  if (seenLabels.has(label)) {
-    console.error(`[heartbeat] entry ${i}: duplicate label "${label}"`)
-    process.exit(1)
+  if (seenLabels.has(label as string)) {
+    await fatal(`[heartbeat] entry ${i}: duplicate label "${label}"`, { reason: 'dup_label' })
   }
-  seenLabels.add(label)
+  seenLabels.add(label as string)
   if (typeof file !== 'string' || !file) {
-    console.error(`[heartbeat] entry "${label}": missing/invalid "file"`)
-    process.exit(1)
+    await fatal(`[heartbeat] entry "${label}": missing/invalid "file"`, { reason: 'bad_file' })
   }
-  if (!existsSync(file)) {
-    console.error(`[heartbeat] entry "${label}": file does not exist: ${file}`)
-    process.exit(1)
+  if (!existsSync(file as string)) {
+    await fatal(`[heartbeat] entry "${label}": file does not exist: ${file}`, { reason: 'missing_target_file' })
   }
 
   const cronExpr = typeof entry.cron === 'string' ? entry.cron : undefined
@@ -206,12 +205,10 @@ for (const [i, entryRaw] of (raw as unknown[]).entries()) {
   const jitterMin = entry.jitter_minutes !== undefined ? Number(entry.jitter_minutes) : undefined
 
   if (cronExpr && intervalMin !== undefined) {
-    console.error(`[heartbeat] entry "${label}": set either "cron" OR "interval_minutes", not both`)
-    process.exit(1)
+    await fatal(`[heartbeat] entry "${label}": set either "cron" OR "interval_minutes", not both`, { reason: 'conflicting_schedule' })
   }
   if (!cronExpr && intervalMin === undefined) {
-    console.error(`[heartbeat] entry "${label}": must set either "cron" or "interval_minutes"`)
-    process.exit(1)
+    await fatal(`[heartbeat] entry "${label}": must set either "cron" or "interval_minutes"`, { reason: 'missing_schedule' })
   }
 
   let cronSpec: CronSpec | undefined
@@ -220,17 +217,14 @@ for (const [i, entryRaw] of (raw as unknown[]).entries()) {
       cronSpec = parseCron(cronExpr)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      console.error(`[heartbeat] entry "${label}": bad cron "${cronExpr}": ${msg}`)
-      process.exit(1)
+      await fatal(`[heartbeat] entry "${label}": bad cron "${cronExpr}": ${msg}`, { reason: 'bad_cron' })
     }
   } else {
     if (!Number.isFinite(intervalMin) || (intervalMin as number) <= 0) {
-      console.error(`[heartbeat] entry "${label}": invalid interval_minutes: ${entry.interval_minutes}`)
-      process.exit(1)
+      await fatal(`[heartbeat] entry "${label}": invalid interval_minutes: ${entry.interval_minutes}`, { reason: 'bad_interval' })
     }
     if (jitterMin !== undefined && (!Number.isFinite(jitterMin) || jitterMin < 0)) {
-      console.error(`[heartbeat] entry "${label}": invalid jitter_minutes: ${entry.jitter_minutes}`)
-      process.exit(1)
+      await fatal(`[heartbeat] entry "${label}": invalid jitter_minutes: ${entry.jitter_minutes}`, { reason: 'bad_jitter' })
     }
   }
 
@@ -247,8 +241,7 @@ for (const [i, entryRaw] of (raw as unknown[]).entries()) {
 }
 
 if (schedules.length === 0) {
-  console.error(`[heartbeat] ${CONFIGS_FILE} contains no schedules; nothing to do`)
-  process.exit(1)
+  await fatal(`[heartbeat] ${CONFIGS_FILE} contains no schedules; nothing to do`, { reason: 'empty_config' })
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +307,7 @@ async function tick(s: Schedule): Promise<void> {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error(`[heartbeat] tick "${s.label}" failed: ${msg}`)
+    captureException(err, { schedule_label: s.label, schedule_file: s.file })
   }
 }
 

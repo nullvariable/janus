@@ -5,6 +5,7 @@
   "type": "module",
   "main": "server.ts",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@sentry/bun": "^8.49.0"
   }
 }

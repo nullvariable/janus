@@ -18,6 +18,10 @@ mcp_servers:
       # into the named tmux pane (instead of emitting Claude-Code-only
       # notifications/claude/channel events). See docs/tui-mcp-bridge.md.
       MATTERMOST_INJECT_TARGET: "claude-agents:links"
+      # Optional Sentry/GlitchTip instrumentation — populated from
+      # /app/agents/links/.env via the launch wrapper. No-op when DSN unset.
+      JANUS_AGENT: ${JANUS_AGENT}
+      GLITCHTIP_DSN: ${GLITCHTIP_DSN}
 
   # Scrapling — primary fetcher for the link archiver. Replaces the CC version's
   # WebFetch+scrapling combo with a single scrapling-only path; stealthy_fetch

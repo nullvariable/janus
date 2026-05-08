@@ -6,6 +6,7 @@
   "main": "server.ts",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "@sentry/bun": "^8.49.0",
     "zod": "^3.24.0"
   }
 }

@@ -1,0 +1,11 @@
+{
+  "name": "planka-channel",
+  "version": "0.2.0",
+  "description": "Planka board bridge MCP server for Janus agents — webhook receiver + event queue",
+  "type": "module",
+  "main": "server.ts",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.24.0"
+  }
+}
