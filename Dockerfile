@@ -39,7 +39,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 USER node
 RUN curl -fsSL https://bun.sh/install | bash
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/home/node/.bun/bin:/home/node/.local/bin:/home/node/planka-venv/bin:$PATH"
+ENV PATH="/home/node/.bun/bin:/home/node/.local/bin:$PATH"
 
 # Install Hermes (Nous Research's autonomous agent runtime). The installer
 # drops code at /home/node/.hermes/hermes-agent/ and a CLI symlink at
@@ -70,10 +70,6 @@ RUN set -eux; \
 RUN printf '%s\n' '#!/bin/sh' \
     'exec /home/node/.bun/bin/bun /opt/bun-global/node_modules/@tobilu/qmd/dist/cli/qmd.js "$@"' \
     > /home/node/.bun/bin/qmd && chmod +x /home/node/.bun/bin/qmd
-
-# Create empty venv for planka-cli with Python 3.13 (uv downloads if needed).
-# planka-cli is installed into this venv at runtime from bind-mounted source.
-RUN /home/node/.local/bin/uv venv --python 3.13 /home/node/planka-venv
 
 # Copy MCP servers and install dependencies (layer-cached)
 WORKDIR /app

@@ -20,11 +20,9 @@ if [[ -d /host-gh ]]; then
   chmod 600 /home/node/.config/gh/*.yml 2>/dev/null || true
 fi
 
-# Install planka-cli into the venv (idempotent — skips if already installed)
-if [[ -d /opt/planka-cli ]] && ! /home/node/planka-venv/bin/planka-cli --help &>/dev/null; then
-  echo "[entrypoint] Installing planka-cli into venv..."
-  /home/node/.local/bin/uv pip install --python /home/node/planka-venv/bin/python -e /opt/planka-cli >/dev/null 2>&1 || \
-    echo "[entrypoint] WARN: planka-cli install failed"
+# plnk is bind-mounted at /usr/local/bin/plnk (Rust binary, glibc-dynamic)
+if ! /usr/local/bin/plnk --version >/dev/null 2>&1; then
+  echo "[entrypoint] WARN: /usr/local/bin/plnk not runnable — Planka access disabled"
 fi
 
 # Update Claude Code on each container start. Non-fatal: if the install fails

@@ -47,9 +47,9 @@ services:
       # <vault>/<year>/<month>.md
       - ${LINKS_VAULT_DIR:-~/vaults/links}:/agents/links/vault
 
-      # planka-cli source — installed into /home/node/planka-venv at startup.
+      # plnk binary (Rust) — replaces legacy planka-cli editable install.
       # Optional: comment out if you don't use Planka.
-      - ${PLANKA_CLI_DIR:-~/projects/planka-cli}:/opt/planka-cli
+      - ${PLNK_BINARY:-~/projects/plnk/target/release/plnk}:/usr/local/bin/plnk:ro
 
       # qmd MCP server — bind-mount the host's whole bun global install so
       # qmd's hoisted node_modules dependencies (fast-glob, better-sqlite3,
