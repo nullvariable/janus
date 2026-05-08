@@ -15,6 +15,11 @@
       "env": {
         "HEARTBEAT_CONFIGS_FILE": "/app/agents/marketing/heartbeats.json"
       }
+    },
+    "qmd": {
+      "command": "/home/node/.bun/bin/qmd",
+      "args": ["mcp"],
+      "env": {}
     }
   }
 }
