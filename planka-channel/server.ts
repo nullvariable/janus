@@ -42,9 +42,23 @@ const STATE_DIR = process.env.PLANKA_STATE_DIR
   ?? join(homedir(), '.claude', 'channels', 'planka')
 
 const PLANKA_URL = process.env.PLANKA_URL
+// Auth: prefer a Bearer token (API key or pre-minted JWT) if provided.
+// Falls back to username/password login flow when PLANKA_TOKEN is unset.
+const PLANKA_TOKEN = process.env.PLANKA_TOKEN || null
 const PLANKA_USERNAME = process.env.PLANKA_USERNAME
 const PLANKA_PASSWORD = process.env.PLANKA_PASSWORD
-const PLANKA_BOARD_ID = process.env.PLANKA_BOARD_ID
+const PLANKA_BOT_USER_ID = process.env.PLANKA_BOT_USER_ID || null
+// Multi-board support: PLANKA_BOARD_IDS=a,b,c is preferred. PLANKA_BOARD_ID
+// (singular) is honored as a fallback so existing single-board agents keep
+// working without config changes.
+const PLANKA_BOARD_IDS_RAW = process.env.PLANKA_BOARD_IDS ?? process.env.PLANKA_BOARD_ID ?? ''
+const PLANKA_BOARD_IDS = new Set(
+  PLANKA_BOARD_IDS_RAW.split(',').map((s) => s.trim()).filter(Boolean),
+)
+// State-dir label. Multi-board agents must set this. Single-board agents
+// default to the board id, preserving the existing path.
+const PLANKA_INSTANCE_NAME = process.env.PLANKA_INSTANCE_NAME
+  ?? (PLANKA_BOARD_IDS.size === 1 ? [...PLANKA_BOARD_IDS][0] : '')
 const PLANKA_WEBHOOK_PORT = Number(process.env.PLANKA_WEBHOOK_PORT ?? '8089')
 const PLANKA_WEBHOOK_TOKEN = process.env.PLANKA_WEBHOOK_TOKEN
 const PUSH_DELAY_MS = Number(process.env.PLANKA_PUSH_DELAY_MS ?? process.env.PLANKA_DEBOUNCE_MS ?? '60000')
@@ -69,22 +83,28 @@ const FORWARDED_NOTIFICATION_TYPES = new Set(
     .split(',').map((s) => s.trim()).filter(Boolean),
 )
 
-if (!PLANKA_URL || !PLANKA_USERNAME || !PLANKA_PASSWORD || !PLANKA_BOARD_ID || !PLANKA_WEBHOOK_TOKEN) {
+const HAVE_AUTH = !!PLANKA_TOKEN || (PLANKA_USERNAME && PLANKA_PASSWORD)
+if (!PLANKA_URL || !HAVE_AUTH || PLANKA_BOARD_IDS.size === 0 || !PLANKA_WEBHOOK_TOKEN) {
   console.error(
-    'Missing required config. Set PLANKA_URL, PLANKA_USERNAME, PLANKA_PASSWORD, ' +
-    'PLANKA_BOARD_ID, and PLANKA_WEBHOOK_TOKEN in environment.',
+    'Missing required config. Set PLANKA_URL, auth (PLANKA_TOKEN OR PLANKA_USERNAME+PLANKA_PASSWORD), ' +
+    'PLANKA_BOARD_IDS (or PLANKA_BOARD_ID for single-board), and PLANKA_WEBHOOK_TOKEN in environment.',
   )
+  process.exit(1)
+}
+if (!PLANKA_INSTANCE_NAME) {
+  console.error('PLANKA_INSTANCE_NAME is required when watching multiple boards (set it to a short agent label, e.g. "myagent").')
   process.exit(1)
 }
 
 for (const [name, val] of [
   ['PLANKA_URL', PLANKA_URL],
-  ['PLANKA_USERNAME', PLANKA_USERNAME],
-  ['PLANKA_PASSWORD', PLANKA_PASSWORD],
-  ['PLANKA_BOARD_ID', PLANKA_BOARD_ID],
+  ['PLANKA_TOKEN', PLANKA_TOKEN ?? ''],
+  ['PLANKA_USERNAME', PLANKA_USERNAME ?? ''],
+  ['PLANKA_PASSWORD', PLANKA_PASSWORD ?? ''],
+  ['PLANKA_BOARD_IDS', PLANKA_BOARD_IDS_RAW],
   ['PLANKA_WEBHOOK_TOKEN', PLANKA_WEBHOOK_TOKEN],
 ] as const) {
-  if (val.includes('${')) {
+  if (val && val.includes('${')) {
     console.error(`${name} contains an unresolved \${...} placeholder; refusing to start. Set ${name} in the agent's .env.`)
     process.exit(1)
   }
@@ -94,8 +114,8 @@ if (PLANKA_WEBHOOK_TOKEN.length < 16) {
   process.exit(1)
 }
 
-mkdirSync(join(STATE_DIR, PLANKA_BOARD_ID), { recursive: true })
-const SERVER_LOG = join(STATE_DIR, PLANKA_BOARD_ID, 'server.log')
+mkdirSync(join(STATE_DIR, PLANKA_INSTANCE_NAME), { recursive: true })
+const SERVER_LOG = join(STATE_DIR, PLANKA_INSTANCE_NAME, 'server.log')
 
 function logServer(msg: string): void {
   const line = `${new Date().toISOString()} ${msg}\n`
@@ -110,17 +130,21 @@ function logServer(msg: string): void {
 const STOP_DIR = '/tmp/planka-stop'
 mkdirSync(STOP_DIR, { recursive: true })
 
+// The Stop hook drops a marker file named after the instance (was: board id).
+// Multi-board agents share one instance name so the hook only needs one
+// PLANKA_INSTANCE_NAME env var to know what to write.
+const STOP_MARKER = PLANKA_INSTANCE_NAME
+
 function setupStopWatcher(onStop: () => void): void {
-  // Drain anything left from a previous run so we don't fire spuriously.
   try {
     for (const f of readdirSync(STOP_DIR)) {
-      if (f === PLANKA_BOARD_ID) {
+      if (f === STOP_MARKER) {
         try { rmSync(join(STOP_DIR, f)) } catch {}
       }
     }
   } catch {}
   watch(STOP_DIR, (_event, filename) => {
-    if (filename !== PLANKA_BOARD_ID) return
+    if (filename !== STOP_MARKER) return
     const path = join(STOP_DIR, filename)
     try { statSync(path) } catch { return }
     try { rmSync(path) } catch {}
@@ -159,13 +183,15 @@ const mcp = new Server(
   },
 )
 
-const queue = new Queue(STATE_DIR, PLANKA_BOARD_ID, PUSH_DELAY_MS)
+const queue = new Queue(STATE_DIR, PLANKA_INSTANCE_NAME, PUSH_DELAY_MS)
 
 const planka = new PlankaClient({
   url: PLANKA_URL,
+  apiToken: PLANKA_TOKEN,
   username: PLANKA_USERNAME,
   password: PLANKA_PASSWORD,
-  boardId: PLANKA_BOARD_ID,
+  botUserIdOverride: PLANKA_BOT_USER_ID,
+  boardIds: PLANKA_BOARD_IDS,
   webhookPort: PLANKA_WEBHOOK_PORT,
   webhookToken: PLANKA_WEBHOOK_TOKEN,
   forwardedEvents: FORWARDED_EVENTS,
@@ -173,7 +199,8 @@ const planka = new PlankaClient({
   logAllEvents: LOG_ALL_EVENTS,
   onEnvelope: (env) => queue.ingest(env),
   onListening: () => logServer(
-    `webhook listener up on :${PLANKA_WEBHOOK_PORT}/webhook board=${PLANKA_BOARD_ID} `
+    `webhook listener up on :${PLANKA_WEBHOOK_PORT}/webhook instance=${PLANKA_INSTANCE_NAME} `
+    + `boards=[${[...PLANKA_BOARD_IDS].join(',')}] `
     + `push_delay=${PUSH_DELAY_MS}ms throttle=${THROTTLE_MS}ms `
     + `forward=[${[...FORWARDED_EVENTS].join(',')}] `
     + `notif_types=[${[...FORWARDED_NOTIFICATION_TYPES].join(',')}]`,
@@ -183,7 +210,8 @@ const planka = new PlankaClient({
 
 planka.login()
   .then(async () => {
-    logServer(`logged in as ${PLANKA_USERNAME} (bot=${planka.getBotUserId() ?? 'unknown'})`)
+    const authMode = PLANKA_TOKEN ? 'token' : `password as ${PLANKA_USERNAME}`
+    logServer(`auth ok via ${authMode} (bot=${planka.getBotUserId() ?? 'unknown'})`)
     if (CATCHUP_MAX > 0) {
       try {
         const n = await planka.catchupNotifications(CATCHUP_MAX)
@@ -332,22 +360,24 @@ async function dispatchOne(): Promise<boolean> {
   const bundle = ready[0]
   if (!queue.markPushed(bundle.bundle_id)) return false
 
-  const body = narrateBundle(bundle, PLANKA_BOARD_ID)
+  const body = narrateBundle(bundle)
 
-  // Claude Code path: emit a channel notification.
   try {
+    // Claude Code's channel notification schema requires every meta value
+    // to be a string. Numbers and arrays trigger a Zod error and drop the
+    // stdio connection. Stringify numbers + comma-join arrays.
     await mcp.notification({
       method: 'notifications/claude/channel',
       params: {
         content: body,
         meta: {
           source: 'planka',
-          board_id: PLANKA_BOARD_ID,
-          card_id: bundle.card_id,
-          card_url: bundle.card_url,
+          board_id: bundle.board_id ?? '',
+          card_id: bundle.card_id ?? '',
+          card_url: bundle.card_url ?? '',
           bundle_id: bundle.bundle_id,
-          event_count: bundle.events.length,
-          event_ids: bundle.events.map((e) => e.event_id),
+          event_count: String(bundle.events.length),
+          event_ids: bundle.events.map((e) => e.event_id).join(','),
           ts: new Date().toISOString(),
         },
       },

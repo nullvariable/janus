@@ -1,30 +1,49 @@
 #!/usr/bin/env node
 /**
- * janus — CLI for the Janus multi-agent container.
+ * janus — CLI for Janus agent containers.
  *
- * Zero deps. Wraps `docker exec` + `tmux` to attach to or talk to running
- * Claude Code agents inside the `claude-agents` container.
+ * Zero deps. Wraps `docker exec`, `docker compose`, and `tmux` to attach to
+ * or talk to running Claude Code agents inside any container built from a
+ * janus image.
+ *
+ * Auto-discovery: iterates running containers whose image starts with
+ * `janus-`, lists tmux windows in their `claude-agents` session, and treats
+ * each window as one addressable agent. Multiple janus containers can run
+ * side-by-side (e.g. one per agent group); the CLI walks all of them.
+ *
+ * Two target types:
+ *  - <agent>     a tmux window name inside a container
+ *  - <target>    a janus container/service name — used by container-level
+ *                commands (update, restart)
  */
 
 const { spawnSync } = require('node:child_process')
+const os = require('node:os')
+const path = require('node:path')
 
-const CONTAINER = 'claude-agents'
 const SESSION = 'claude-agents'
+const IMAGE_PREFIX = 'janus-'
+const JANUS_DIR = process.env.JANUS_DIR || path.join(os.homedir(), 'projects/janus')
 
 function usage(code = 0) {
-  process.stdout.write(`janus — Janus multi-agent container CLI
+  process.stdout.write(`janus — Janus agent container CLI
 
 Usage:
-  janus list                List agent windows in the running session
-  janus attach [agent]      Attach to the tmux session, optionally jumping to <agent>
-  janus send <agent> <msg>  Send a single-line message into <agent>'s prompt
-  janus restart [agent]     Restart one or all agent panes
-  janus help                Show this help
+  janus list                    List all agent windows across janus containers
+  janus attach [agent]          Attach to a session, optionally jumping to <agent>
+  janus send <agent> <msg>      Send a single-line message into <agent>'s prompt
+  janus respawn [agent]         Respawn one agent's pane (in-container tmux), or all
+  janus restart [target]        Recreate a container — fresh mounts, no rebuild.
+                                (Bypasses WSL bind-mount cache that 'docker restart'
+                                hits.) Omit <target> to restart all running.
+  janus update [target]         Full rebuild + recreate — picks up code changes,
+                                dep changes, and refreshes claude-code on boot.
+                                Omit <target> to update all running.
+  janus help                    Show this help
 
-  janus update              Restart the container (entrypoint pulls latest claude-code)
-
-Not yet implemented:
-  janus status              Context usage and running state per agent
+Targets:
+  <agent>   tmux window name (one of the agents under agents/)
+  <target>  container/service name (whatever you set in docker-compose.yml)
 
 Inside an attached session:
   Ctrl-b d        detach (agents keep running)
@@ -34,49 +53,92 @@ Inside an attached session:
   process.exit(code)
 }
 
-function ensureContainerRunning() {
-  const r = spawnSync('docker', ['inspect', '-f', '{{.State.Running}}', CONTAINER], { encoding: 'utf8' })
-  if (r.status !== 0 || r.stdout.trim() !== 'true') {
-    console.error(`error: container "${CONTAINER}" is not running`)
-    console.error(`try: cd ~/projects/janus && docker compose up -d`)
-    process.exit(1)
-  }
+/** Running containers whose image starts with IMAGE_PREFIX. */
+function listJanusContainers() {
+  const r = spawnSync('docker', ['ps', '--format', '{{.Names}}\t{{.Image}}'], { encoding: 'utf8' })
+  if (r.status !== 0) return []
+  return r.stdout.trim().split('\n').filter(Boolean)
+    .map((line) => {
+      const [name, image] = line.split('\t')
+      return { name, image }
+    })
+    .filter((c) => c.image.startsWith(IMAGE_PREFIX))
 }
 
-function listAgents() {
-  ensureContainerRunning()
-  const r = spawnSync(
-    'docker',
-    ['exec', CONTAINER, 'tmux', 'list-windows', '-t', SESSION, '-F', '#{window_index}:#{window_name}'],
-    { encoding: 'utf8' },
-  )
-  if (r.status !== 0) {
-    console.error(r.stderr || 'failed to list tmux windows')
+/** Walk every janus container's claude-agents session, return one row per window. */
+function discoverAgents() {
+  const containers = listJanusContainers()
+  const out = []
+  for (const c of containers) {
+    const r = spawnSync(
+      'docker',
+      ['exec', c.name, 'tmux', 'list-windows', '-t', SESSION, '-F', '#{window_index}:#{window_name}'],
+      { encoding: 'utf8' },
+    )
+    if (r.status !== 0) continue
+    for (const line of r.stdout.trim().split('\n').filter(Boolean)) {
+      const [index, ...nameParts] = line.split(':')
+      out.push({ container: c.name, agent: nameParts.join(':'), index })
+    }
+  }
+  return out
+}
+
+function findAgent(agentName) {
+  return discoverAgents().find((a) => a.agent === agentName) ?? null
+}
+
+function ensureAnyJanusContainer() {
+  const containers = listJanusContainers()
+  if (containers.length === 0) {
+    console.error('error: no janus containers are running')
+    console.error('try: cd ~/projects/janus && docker compose up -d')
     process.exit(1)
   }
-  return r.stdout
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => {
-      const [index, ...nameParts] = line.split(':')
-      return { index, name: nameParts.join(':') }
-    })
+  return containers
 }
 
 function cmdList() {
-  const agents = listAgents()
-  for (const a of agents) console.log(`${a.index}\t${a.name}`)
+  ensureAnyJanusContainer()
+  const agents = discoverAgents()
+  if (agents.length === 0) {
+    console.error('error: no agent windows found')
+    process.exit(1)
+  }
+  const byContainer = new Map()
+  for (const a of agents) {
+    if (!byContainer.has(a.container)) byContainer.set(a.container, [])
+    byContainer.get(a.container).push(a)
+  }
+  for (const [container, rows] of byContainer) {
+    console.log(`${container}:`)
+    for (const a of rows) console.log(`  ${a.index}\t${a.agent}`)
+  }
 }
 
 function cmdAttach(agent) {
-  ensureContainerRunning()
-  const args = ['exec', '-it', CONTAINER, 'tmux', 'attach', '-t', SESSION]
+  ensureAnyJanusContainer()
   if (agent) {
-    args.push(';', 'select-window', '-t', agent)
+    const found = findAgent(agent)
+    if (!found) {
+      const all = discoverAgents().map((a) => `${a.container}:${a.agent}`).join(', ')
+      console.error(`error: no agent window named "${agent}"`)
+      console.error(`available: ${all || '(none)'}`)
+      process.exit(1)
+    }
+    const args = ['exec', '-it', found.container, 'tmux', 'attach', '-t', SESSION, ';', 'select-window', '-t', agent]
+    const r = spawnSync('docker', args, { stdio: 'inherit' })
+    process.exit(r.status ?? 1)
   }
-  const r = spawnSync('docker', args, { stdio: 'inherit' })
-  process.exit(r.status ?? 1)
+  const containers = listJanusContainers()
+  if (containers.length === 1) {
+    const r = spawnSync('docker', ['exec', '-it', containers[0].name, 'tmux', 'attach', '-t', SESSION], { stdio: 'inherit' })
+    process.exit(r.status ?? 1)
+  }
+  console.error('error: multiple janus containers are running; specify an agent name')
+  console.error(`running: ${containers.map((c) => c.name).join(', ')}`)
+  console.error('try: janus list')
+  process.exit(1)
 }
 
 function cmdSend(agent, message) {
@@ -84,82 +146,111 @@ function cmdSend(agent, message) {
     console.error('usage: janus send <agent> <message>')
     process.exit(1)
   }
-  ensureContainerRunning()
-
-  // Verify the target window exists so we get a friendly error rather than a
-  // tmux "can't find window" message.
-  const agents = listAgents()
-  if (!agents.some((a) => a.name === agent)) {
+  ensureAnyJanusContainer()
+  const found = findAgent(agent)
+  if (!found) {
+    const all = discoverAgents().map((a) => a.agent).join(', ')
     console.error(`error: no agent window named "${agent}"`)
-    console.error(`available: ${agents.map((a) => a.name).join(', ')}`)
+    console.error(`available: ${all || '(none)'}`)
     process.exit(1)
   }
-
   const target = `${SESSION}:${agent}`
-
-  // send-keys -l sends literal text (no key interpretation), then a separate
-  // call sends Enter to submit. Works for single-line messages; multi-line
-  // input would need a different approach (load-buffer / paste-buffer).
   const sendText = spawnSync(
     'docker',
-    ['exec', CONTAINER, 'tmux', 'send-keys', '-t', target, '-l', message],
+    ['exec', found.container, 'tmux', 'send-keys', '-t', target, '-l', message],
     { stdio: 'inherit' },
   )
   if (sendText.status !== 0) process.exit(sendText.status ?? 1)
-
   const sendEnter = spawnSync(
     'docker',
-    ['exec', CONTAINER, 'tmux', 'send-keys', '-t', target, 'Enter'],
+    ['exec', found.container, 'tmux', 'send-keys', '-t', target, 'Enter'],
     { stdio: 'inherit' },
   )
   process.exit(sendEnter.status ?? 1)
 }
 
-function cmdRestart(agent) {
-  ensureContainerRunning()
-
-  const agents = listAgents()
+/** In-container tmux pane respawn — was previously `restart`. */
+function cmdRespawn(agent) {
+  ensureAnyJanusContainer()
+  const all = discoverAgents()
   let targets
-
   if (agent) {
-    if (!agents.some((a) => a.name === agent)) {
+    const found = all.find((a) => a.agent === agent)
+    if (!found) {
       console.error(`error: no agent window named "${agent}"`)
-      console.error(`available: ${agents.map((a) => a.name).join(', ')}`)
+      console.error(`available: ${all.map((a) => a.agent).join(', ')}`)
       process.exit(1)
     }
-    targets = [agent]
+    targets = [found]
   } else {
-    targets = agents.map((a) => a.name)
+    targets = all
   }
-
-  for (const name of targets) {
-    console.log(`restarting ${name}...`)
-    const target = `${SESSION}:${name}`
-    // Respawn the pane (killing it if still running), then mirror entrypoint's
-    // accept_startup_prompts in a background subshell so the CLI returns immediately.
+  for (const t of targets) {
+    console.log(`respawning ${t.container}:${t.agent}...`)
+    const target = `${SESSION}:${t.agent}`
     const script =
       `tmux respawn-pane -k -t ${target} && ` +
       `(sleep 8 && tmux send-keys -t ${target} Enter 2>/dev/null; ` +
       `sleep 5 && tmux send-keys -t ${target} Enter 2>/dev/null) &`
-    const r = spawnSync('docker', ['exec', CONTAINER, 'bash', '-c', script], { stdio: 'inherit' })
+    const r = spawnSync('docker', ['exec', t.container, 'bash', '-c', script], { stdio: 'inherit' })
     if (r.status !== 0) {
-      console.error(`failed to restart ${name}`)
+      console.error(`failed to respawn ${t.container}:${t.agent}`)
       process.exit(r.status ?? 1)
     }
   }
 }
 
-function notImplemented(name) {
-  console.error(`'${name}' is not implemented yet`)
-  process.exit(2)
+/**
+ * Resolve which compose services to operate on. If target is given, validate
+ * it's a known janus container OR pass through (compose will validate).
+ * If omitted, return all currently-running janus container names.
+ */
+function resolveTargets(target) {
+  const containers = ensureAnyJanusContainer()
+  if (!target) return containers.map((c) => c.name)
+  const known = containers.find((c) => c.name === target)
+  if (!known) {
+    console.error(`warning: "${target}" is not a currently-running janus container`)
+    console.error(`running: ${containers.map((c) => c.name).join(', ')}`)
+    console.error('passing through to docker compose anyway — it will fail with a clearer error if invalid')
+  }
+  return [target]
 }
 
-function cmdUpdate() {
-  ensureContainerRunning()
-  console.log(`restarting ${CONTAINER} (entrypoint will pull latest claude-code)...`)
-  const r = spawnSync('docker', ['restart', CONTAINER], { stdio: 'inherit' })
+/**
+ * Recreate containers without rebuilding the image. Bypasses the WSL bind-
+ * mount cache that `docker restart` triggers. Same effect as the nightly
+ * cron's down+up, faster for one-off interactive use.
+ */
+function cmdRestart(target) {
+  const targets = resolveTargets(target)
+  console.log(`recreating: ${targets.join(', ')}`)
+  const r = spawnSync(
+    'docker',
+    ['compose', 'up', '-d', '--force-recreate', ...targets],
+    { stdio: 'inherit', cwd: JANUS_DIR },
+  )
   if (r.status !== 0) {
-    console.error(`failed to restart ${CONTAINER}`)
+    console.error('docker compose up failed')
+    process.exit(r.status ?? 1)
+  }
+}
+
+/**
+ * Full rebuild + recreate. Picks up code changes in mattermost-channel/,
+ * planka-channel/, heartbeat/, dep changes, etc. Always force-recreates so
+ * even unchanged-image services get fresh mounts (WSL cache fix).
+ */
+function cmdUpdate(target) {
+  const targets = resolveTargets(target)
+  console.log(`rebuilding + recreating: ${targets.join(', ')}`)
+  const r = spawnSync(
+    'docker',
+    ['compose', 'up', '-d', '--build', '--force-recreate', ...targets],
+    { stdio: 'inherit', cwd: JANUS_DIR },
+  )
+  if (r.status !== 0) {
+    console.error('docker compose up --build failed')
     process.exit(r.status ?? 1)
   }
 }
@@ -181,15 +272,18 @@ switch (cmd) {
   case 'send':
     cmdSend(rest[0], rest.slice(1).join(' '))
     break
+  case 'respawn':
+    cmdRespawn(rest[0])
+    break
   case 'restart':
     cmdRestart(rest[0])
     break
   case 'update':
-    cmdUpdate()
+    cmdUpdate(rest[0])
     break
   case 'status':
-    notImplemented(cmd)
-    break
+    console.error(`'status' is not implemented yet — see README "Notes on status"`)
+    process.exit(2)
   default:
     console.error(`unknown command: ${cmd}`)
     usage(1)

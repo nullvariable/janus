@@ -17,9 +17,21 @@ import { newEventId, type EventEnvelope } from './queue.js'
 
 export interface PlankaClientOpts {
   url: string
-  username: string
-  password: string
-  boardId: string
+  /** If set, used as a Bearer token directly — no login. Username/password ignored. */
+  apiToken?: string | null
+  /** Used by the username/password login flow when apiToken is not set. */
+  username?: string
+  password?: string
+  /**
+   * Override for the "this is the bot's user id" used to filter inbound
+   * notifications. Useful when auth is via a SHARED API key (e.g. an admin
+   * key) but events should be filtered as if posted to a DIFFERENT user
+   * (the agent's bot id). Without this, the server resolves bot user id
+   * from /api/users/me, which reflects the API key's owner, not the agent's.
+   */
+  botUserIdOverride?: string | null
+  /** Board IDs this instance subscribes to. One or more. */
+  boardIds: Set<string>
   webhookPort: number
   webhookToken: string
   /** Webhook event names allowlisted for forwarding to the queue. Use `*` for all. */
@@ -41,9 +53,10 @@ interface PlankaWebhookBody {
 
 export class PlankaClient {
   private url: string
-  private username: string
-  private password: string
-  private boardId: string
+  private apiToken: string | null
+  private username: string | null
+  private password: string | null
+  private boardIds: Set<string>
   private webhookPort: number
   private webhookToken: string
   private forwardedEvents: Set<string>
@@ -59,9 +72,12 @@ export class PlankaClient {
 
   constructor(opts: PlankaClientOpts) {
     this.url = opts.url.replace(/\/+$/, '')
-    this.username = opts.username
-    this.password = opts.password
-    this.boardId = opts.boardId
+    this.apiToken = opts.apiToken ?? null
+    this.username = opts.username ?? null
+    this.password = opts.password ?? null
+    if (this.apiToken) this.token = this.apiToken
+    if (opts.botUserIdOverride) this.botUserId = opts.botUserIdOverride
+    this.boardIds = opts.boardIds
     this.webhookPort = opts.webhookPort
     this.webhookToken = opts.webhookToken
     this.forwardedEvents = opts.forwardedEvents
@@ -72,29 +88,61 @@ export class PlankaClient {
     this.logAllEvents = opts.logAllEvents ?? false
   }
 
-  async login(): Promise<string> {
-    const res = await fetch(`${this.url}/api/access-tokens`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ emailOrUsername: this.username, password: this.password }),
-    })
-    if (!res.ok) {
-      throw new Error(`Planka login failed: ${res.status} ${await res.text()}`)
+  /**
+   * Auth headers. Planka has two flavours:
+   *  - `Authorization: Bearer <jwt>` for access tokens (login flow)
+   *  - `x-api-key: <key>` for user API keys (POST /api/users/:id/api-key)
+   * If apiToken was provided, sniff the format: JWTs start with "eyJ" and
+   * have two dots; opaque random keys go to x-api-key.
+   */
+  private authHeaders(): Record<string, string> {
+    if (this.apiToken) {
+      const looksLikeJwt = this.apiToken.startsWith('eyJ') && this.apiToken.split('.').length === 3
+      return looksLikeJwt
+        ? { Authorization: `Bearer ${this.apiToken}` }
+        : { 'x-api-key': this.apiToken }
     }
-    const body = await res.json() as { item: string }
-    this.token = body.item
+    if (this.token) return { Authorization: `Bearer ${this.token}` }
+    return {}
+  }
 
-    try {
-      const me = await fetch(`${this.url}/api/users/me`, {
-        headers: { Authorization: `Bearer ${this.token}` },
-      })
-      if (me.ok) {
-        const json = await me.json() as { item?: { id?: string } }
-        this.botUserId = json.item?.id ?? null
+  /**
+   * Authenticate. If apiToken was provided, skip login — just resolve bot
+   * user id via /api/users/me. Otherwise POST username/password to mint a
+   * JWT and use that.
+   */
+  async login(): Promise<string> {
+    if (!this.apiToken) {
+      if (!this.username || !this.password) {
+        throw new Error('Planka auth: provide PLANKA_TOKEN (Bearer) or PLANKA_USERNAME+PLANKA_PASSWORD')
       }
-    } catch {}
+      const res = await fetch(`${this.url}/api/access-tokens`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emailOrUsername: this.username, password: this.password }),
+      })
+      if (!res.ok) {
+        throw new Error(`Planka login failed: ${res.status} ${await res.text()}`)
+      }
+      const body = await res.json() as { item: string }
+      this.token = body.item
+    }
 
-    return this.token
+    // Skip the /api/users/me lookup if the override is already set —
+    // otherwise we'd clobber it with the API key owner's id.
+    if (!this.botUserId) {
+      try {
+        const me = await fetch(`${this.url}/api/users/me`, {
+          headers: this.authHeaders(),
+        })
+        if (me.ok) {
+          const json = await me.json() as { item?: { id?: string } }
+          this.botUserId = json.item?.id ?? null
+        }
+      } catch {}
+    }
+
+    return this.token!
   }
 
   getBotUserId(): string | null {
@@ -178,14 +226,19 @@ export class PlankaClient {
     let notificationId: string | null = null
     let commentId: string | null = null
     let type = ev
+    let resolvedBoardId: string | null = null
 
     switch (ev) {
       case 'notificationCreate':
       case 'notificationUpdate': {
         // Recipient must be the bot.
         if (this.botUserId && item.userId && item.userId !== this.botUserId) return
+        // Notification carries its own boardId.
+        const boardId = item.boardId ?? this.findBoardId(body)
+        if (boardId && !this.boardIds.has(boardId)) return
         notificationId = item.id ?? null
         cardId = item.cardId ?? null
+        resolvedBoardId = boardId ?? null
         type = 'notification'
         break
       }
@@ -195,17 +248,19 @@ export class PlankaClient {
         // Echo filter: skip the bot's own comments coming back through.
         if (this.botUserId && item.userId === this.botUserId) return
         const boardId = this.findBoardId(body)
-        if (boardId && boardId !== this.boardId) return
+        if (boardId && !this.boardIds.has(boardId)) return
         commentId = item.id ?? null
         cardId = item.cardId ?? null
+        resolvedBoardId = boardId ?? null
         type = ev
         break
       }
       case 'actionCreate': {
         if (this.botUserId && item.userId === this.botUserId) return
         const boardId = this.findBoardId(body)
-        if (boardId && boardId !== this.boardId) return
+        if (boardId && !this.boardIds.has(boardId)) return
         cardId = item.cardId ?? null
+        resolvedBoardId = boardId ?? null
         type = item.type === 'commentCard' ? 'comment' : 'action'
         commentId = item.type === 'commentCard' ? item.id ?? null : null
         break
@@ -219,8 +274,9 @@ export class PlankaClient {
       case 'cardMembershipDelete': {
         if (this.botUserId && actorUserId === this.botUserId) return
         const boardId = item.boardId ?? this.findBoardId(body)
-        if (boardId && boardId !== this.boardId) return
+        if (boardId && !this.boardIds.has(boardId)) return
         cardId = item.id ?? item.cardId ?? null
+        resolvedBoardId = boardId ?? null
         type = ev
         break
       }
@@ -236,7 +292,9 @@ export class PlankaClient {
       event_id: newEventId(),
       ts: new Date().toISOString(),
       type,
-      board_id: this.boardId,
+      // For multi-board instances, stamp the actual event's board_id rather
+      // than a fixed value — narration and audit trail need it accurate.
+      board_id: resolvedBoardId ?? (this.boardIds.size === 1 ? [...this.boardIds][0] : ''),
       card_id: cardId,
       notification_id: notificationId,
       comment_id: commentId,
@@ -332,7 +390,7 @@ export class PlankaClient {
     let res: Response
     try {
       res = await fetch(`${this.url}/api/notifications`, {
-        headers: { Authorization: `Bearer ${this.token}` },
+        headers: this.authHeaders(),
       })
     } catch (err) {
       this.onError?.(`catchup fetch threw: ${err instanceof Error ? err.message : String(err)}`)
@@ -355,7 +413,7 @@ export class PlankaClient {
       if (n.isRead) continue
       if (this.botUserId && n.userId !== this.botUserId) continue
       unreadForBot++
-      if (n.boardId && n.boardId !== this.boardId) continue
+      if (n.boardId && !this.boardIds.has(n.boardId)) continue
       if (!this.forwardedEvents.has('*') && !this.forwardedEvents.has('notificationCreate')) continue
       if (!this.forwardedNotificationTypes.has('*') && !this.forwardedNotificationTypes.has(n.type ?? '')) continue
       if (emitted >= maxItems) break
@@ -370,7 +428,7 @@ export class PlankaClient {
         event_id: newEventId(),
         ts: n.createdAt ?? new Date().toISOString(),
         type: 'notification',
-        board_id: this.boardId,
+        board_id: n.boardId ?? (this.boardIds.size === 1 ? [...this.boardIds][0] : ''),
         card_id: n.cardId ?? null,
         notification_id: n.id ?? null,
         comment_id: null,
@@ -390,27 +448,43 @@ export class PlankaClient {
   }
 
   async getCard(cardId: string): Promise<unknown> {
-    if (!this.token) await this.login()
-    const res = await fetch(`${this.url}/api/cards/${cardId}`, {
-      headers: { Authorization: `Bearer ${this.token}` },
-    })
-    if (!res.ok) throw new Error(`getCard ${cardId}: ${res.status} ${await res.text()}`)
+    const res = await this.restWithRetry(`getCard ${cardId}`, () =>
+      fetch(`${this.url}/api/cards/${cardId}`, { headers: this.authHeaders() }),
+    )
     return res.json()
   }
 
   async postComment(cardId: string, text: string): Promise<string> {
-    if (!this.token) await this.login()
-    const res = await fetch(`${this.url}/api/cards/${cardId}/comments`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ text }),
-    })
-    if (!res.ok) throw new Error(`postComment: ${res.status} ${await res.text()}`)
+    const res = await this.restWithRetry('postComment', () =>
+      fetch(`${this.url}/api/cards/${cardId}/comments`, {
+        method: 'POST',
+        headers: { ...this.authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      }),
+    )
     const body = await res.json() as { item?: { id?: string } }
     return body.item?.id ?? ''
+  }
+
+  /**
+   * REST with auto-retry on 401: JWT-auth (username/password login flow) can
+   * re-mint a fresh token and retry once. API-key auth can't refresh — a 401
+   * there means the key was rotated out-of-band and needs replacing in the
+   * agent's env.
+   */
+  private async restWithRetry(label: string, send: () => Promise<Response>): Promise<Response> {
+    if (!this.token) await this.login()
+    let res = await send()
+    if (res.status === 401 && !this.apiToken && this.username && this.password) {
+      this.onError?.(`${label}: 401 — refreshing JWT and retrying`)
+      this.token = null
+      await this.login()
+      res = await send()
+    }
+    if (!res.ok) {
+      throw new Error(`${label}: ${res.status} ${(await res.text()).slice(0, 200)}`)
+    }
+    return res
   }
 }
 
