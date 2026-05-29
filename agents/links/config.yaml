@@ -18,6 +18,12 @@ mcp_servers:
       # into the named tmux pane (instead of emitting Claude-Code-only
       # notifications/claude/channel events). See docs/tui-mcp-bridge.md.
       MATTERMOST_INJECT_TARGET: "claude-agents:links"
+      # Pause between the content send-keys and the trailing Enter. The 200ms
+      # default can be too short on slow hosts (e.g. WSL2 + a narrow pane =
+      # slow paste stream): the Enter lands inside Hermes Ink's paste-flush
+      # window and is stripped, leaving content in the input field unsubmitted.
+      # 500ms clears it. See docs/tui-mcp-bridge.md Pitfall #1 / tuning knobs.
+      MATTERMOST_INJECT_ENTER_GAP_MS: "500"
       # Optional Sentry/GlitchTip instrumentation — populated from
       # /app/agents/links/.env via the launch wrapper. No-op when DSN unset.
       JANUS_AGENT: ${JANUS_AGENT}
