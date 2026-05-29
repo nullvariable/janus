@@ -411,12 +411,20 @@ function maybeCompact(): void {
   if (!queue.isIdle()) return
   const lastIngest = queue.lastIngestAt()
   const lastStop = queue.getState().last_stop_at
-  // "Idle" reference = max(last ingest, last stop, last compact). Without
-  // this, fresh starts would compact immediately even though no work happened.
+  // "Idle" reference = the most recent real activity (ingest or agent stop).
+  // Excluding lastCompactAt is deliberate: if we included it, every successful
+  // compact would reset the idle clock against itself and we'd refire every
+  // COMPACT_AFTER_IDLE_MS forever even when nothing else happened.
   const now = Date.now()
-  const ref = Math.max(lastIngest ?? 0, lastStop ?? 0, lastCompactAt, 0)
+  const ref = Math.max(lastIngest ?? 0, lastStop ?? 0, 0)
   if (ref === 0) return // never had any activity, don't compact
   if (now - ref < COMPACT_AFTER_IDLE_MS) return
+  // Don't refire if we've already compacted and no NEW webhook ingest has
+  // happened since. /compact itself triggers a Stop hook (the agent's
+  // turn-end after compacting), so lastStop alone can't distinguish "real
+  // new work" from "compact's own response". Ingest is the unambiguous
+  // signal of new work; require that to re-arm.
+  if (lastCompactAt > 0 && (lastIngest ?? 0) <= lastCompactAt) return
 
   const r1 = tmux(['send-keys', '-t', TMUX_TARGET, '/compact'])
   if (r1.code !== 0) {

@@ -91,8 +91,15 @@ declare -A CHANNELS=(
 declare -A MODELS=(
 )
 
-# Ordered list (bash associative arrays don't preserve order)
-AGENT_ORDER=(health geordi marketing links)
+# Ordered list (bash associative arrays don't preserve order). Set JANUS_AGENTS
+# (space-separated) to run only a subset of the fleet — e.g. a single-agent
+# peer container that sets JANUS_AGENTS=geordi while the main container leaves
+# it unset and gets the full default roster.
+if [[ -n "${JANUS_AGENTS:-}" ]]; then
+  read -ra AGENT_ORDER <<< "$JANUS_AGENTS"
+else
+  AGENT_ORDER=(health geordi marketing links)
+fi
 
 # Build the full claude command for an agent including its channel flags
 build_claude_cmd() {
@@ -181,7 +188,10 @@ start_session() {
     # vars sourced later by setup_agent never reach later windows. Sourcing
     # inside the per-window shell ensures every agent process gets its own
     # secrets (e.g. for ${...} substitution in .mcp.json / config.yaml).
-    local launch="cd $workdir && [ -f .env ] && { set -a; . ./.env; set +a; }; $cmd"
+    # Source the image-baked /app/agents/$name/.env first (carries JANUS_AGENT
+    # and GLITCHTIP_DSN), then the workdir's .env (project-specific tokens —
+    # may override if both define a key, which is intentional).
+    local launch="cd $workdir && [ -f /app/agents/$name/.env ] && { set -a; . /app/agents/$name/.env; set +a; }; [ -f .env ] && { set -a; . ./.env; set +a; }; $cmd"
 
     if $first; then
       # Create the tmux session with the first agent
@@ -228,7 +238,7 @@ while true; do
       sleep 5
       setup_agent "$name"
       cmd=$(build_agent_cmd "$name")
-      launch="cd $workdir && [ -f .env ] && { set -a; . ./.env; set +a; }; $cmd"
+      launch="cd $workdir && [ -f /app/agents/$name/.env ] && { set -a; . /app/agents/$name/.env; set +a; }; [ -f .env ] && { set -a; . ./.env; set +a; }; $cmd"
       tmux respawn-pane -t "$SESSION:$name" "$launch" 2>/dev/null || true
       if [[ "${KIND[$name]:-claude}" == "claude" ]]; then
         accept_startup_prompts "$name"
