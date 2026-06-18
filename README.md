@@ -5,9 +5,11 @@
 > Built by **[Doug Cone](https://nullvariable.com)**.
 > Available for consulting on multi-agent infrastructure, AI integration, and production agent platforms.
 
-## One container, four TUIs
+## One image, four TUIs
 
-Janus runs Claude Code, Hermes, OpenCode, or Codex agents from a single Docker container — each in its own tmux window, all sharing one set of MCP servers, one credential store, and one event bus. Inbound events come from Mattermost (or any source you wire in); outbound responses go back through the same channel. The `cli/janus` driver attaches to a specific agent's pane on demand.
+Janus runs Claude Code, Hermes, OpenCode, or Codex agents — each in its own tmux window, with the agents in a container sharing one set of MCP servers, one credential store, and one event bus. Inbound events come from Mattermost (or any source you wire in); outbound responses go back through the same channel. The `cli/janus` driver attaches to a specific agent's pane on demand.
+
+The shipped example is a single `claude-agents` container running four agents. The same image scales to **multiple containers side-by-side** — one per agent group, or an isolated container for an agent that needs a different blast radius (broader host mounts, separate credentials). Spin one up as a one-line compose service that sets `JANUS_AGENTS=<name>` to restrict it to that agent; `cli/janus` auto-discovers every running janus container and addresses agents across all of them.
 
 The interesting part is bridging runtimes that don't speak Claude Code's channel protocol. The pattern is documented in [docs/tui-mcp-bridge.md](docs/tui-mcp-bridge.md); two halves, both runtime-agnostic at their boundary:
 
@@ -240,7 +242,7 @@ cd ./cli && npm link              # adds `janus` to $PATH
 
 | Command | What it does |
 |---|---|
-| `janus list` | List agent windows (index + name). |
+| `janus list` | List agent windows across every running janus container (auto-discovered by image prefix). |
 | `janus attach [agent]` | Attach to the tmux session, optionally jumping to `<agent>`. |
 | `janus send <agent> <msg>` | Send a single-line message into `<agent>`'s prompt without attaching. |
 | `janus help` | Show help. |
