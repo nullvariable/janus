@@ -15,8 +15,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libx11-6 libxcb1 libxext6 libxi6 libxtst6 fonts-liberation \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code globally
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude Code globally, then hand the global npm prefix to the node
+# user. The container runs entirely as `node` (USER node below) and the
+# entrypoint self-updates claude-code on every start via `npm i -g ...@latest`.
+# Without this chown that update fails with EACCES (node can't rename inside
+# the root-owned /usr/local/lib/node_modules), so agents stay pinned to the
+# image-baked version. Giving node the prefix lets the nightly update succeed.
+RUN npm install -g @anthropic-ai/claude-code \
+    && chown -R node:node /usr/local/lib/node_modules /usr/local/bin
 
 # Symlink the host-side home path to the container's node home so absolute
 # paths stored in ~/.claude/plugins/*.json (which reference /home/${HOST_USER}

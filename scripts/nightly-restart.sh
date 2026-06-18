@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # nightly-restart.sh — recycle every janus container to:
-#   1. pull the latest @anthropic-ai/claude-code (entrypoint runs npm i -g
+#   1. rebuild the image so Dockerfile/source changes (entrypoint, hooks,
+#      agent configs, MCP servers) land in the running containers. The build
+#      runs BEFORE the down, so a build failure aborts (set -e) and leaves the
+#      currently-running stack untouched rather than tearing it down.
+#   2. pull the latest @anthropic-ai/claude-code (entrypoint runs npm i -g
 #      claude-code@latest on each boot, see entrypoint.sh)
-#   2. reset every agent's Claude Code context window (long-running sessions
+#   3. reset every agent's Claude Code context window (long-running sessions
 #      drift toward the limit; canonical state lives on disk anyway —
 #      memory files, Planka, vault — so dropping in-session memory is safe)
-#   3. clear stale Docker Desktop WSL bind-mount cache (a known issue that
+#   4. clear stale Docker Desktop WSL bind-mount cache (a known issue that
 #      breaks `docker compose restart` cleanly; we use `down` + `up` instead)
 #
 # Designed to be called from a host crontab. Logs stdout+stderr to
@@ -52,6 +56,13 @@ if [[ -z "${RUNNING_SERVICES// }" ]]; then
   exit 0
 fi
 echo "running services: $RUNNING_SERVICES"
+
+# Rebuild first, while the old containers are still up. With set -e a build
+# failure exits here, before the down — so a bad build never leaves the stack
+# offline; the existing containers just keep running until the next attempt.
+echo "build..."
+# shellcheck disable=SC2086
+docker compose build $RUNNING_SERVICES
 
 echo "down..."
 docker compose down
