@@ -32,6 +32,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { existsSync, readFileSync } from 'node:fs'
 import { initSentry, captureException, fatalAndExit } from './sentry.js'
+import { type CronSpec, parseCron, nextCronTick, cronSearchSeed } from './cron.js'
 
 initSentry('heartbeat')
 
@@ -43,16 +44,6 @@ async function fatal(msg: string, tags?: Record<string, string>): Promise<never>
 // ---------------------------------------------------------------------------
 // Schedule type + loader
 // ---------------------------------------------------------------------------
-
-interface CronSpec {
-  minute: Set<number>
-  hour: Set<number>
-  dom: Set<number>
-  month: Set<number>
-  dow: Set<number>
-  domStar: boolean
-  dowStar: boolean
-}
 
 interface Schedule {
   label: string
@@ -82,94 +73,6 @@ try {
 }
 if (!Array.isArray(raw)) {
   await fatal(`[heartbeat] ${CONFIGS_FILE} must contain a JSON array`, { reason: 'bad_format' })
-}
-
-// ---------------------------------------------------------------------------
-// Cron parser — minimal 5-field implementation
-// ---------------------------------------------------------------------------
-
-function parseField(field: string, min: number, max: number): { values: Set<number>; isStar: boolean } {
-  const values = new Set<number>()
-  const isStar = field === '*'
-  for (const part of field.split(',')) {
-    let stepMatch = part.match(/^(.+)\/(\d+)$/)
-    let base = stepMatch ? stepMatch[1] : part
-    const step = stepMatch ? Number(stepMatch[2]) : 1
-    if (!Number.isFinite(step) || step <= 0) throw new Error(`bad step in cron field: ${part}`)
-    let lo: number
-    let hi: number
-    if (base === '*') {
-      lo = min
-      hi = max
-    } else {
-      const range = base.match(/^(\d+)(?:-(\d+))?$/)
-      if (!range) throw new Error(`bad cron field token: ${part}`)
-      lo = Number(range[1])
-      hi = range[2] !== undefined ? Number(range[2]) : lo
-    }
-    if (lo < min || hi > max || lo > hi) {
-      throw new Error(`cron value out of range [${min}-${max}]: ${part}`)
-    }
-    for (let v = lo; v <= hi; v += step) values.add(v)
-  }
-  return { values, isStar }
-}
-
-function parseCron(s: string): CronSpec {
-  const fields = s.trim().split(/\s+/)
-  if (fields.length !== 5) {
-    throw new Error(`cron expression must have 5 fields, got ${fields.length}: "${s}"`)
-  }
-  const m = parseField(fields[0], 0, 59)
-  const h = parseField(fields[1], 0, 23)
-  const d = parseField(fields[2], 1, 31)
-  const mo = parseField(fields[3], 1, 12)
-  const w = parseField(fields[4], 0, 6) // 0 = Sunday
-  return {
-    minute: m.values,
-    hour: h.values,
-    dom: d.values,
-    month: mo.values,
-    dow: w.values,
-    domStar: d.isStar,
-    dowStar: w.isStar,
-  }
-}
-
-// Walk minute-by-minute starting from `from + 1 minute`, return next match.
-// Cron semantics: dom and dow are OR'd unless both are restricted (vixie).
-function nextCronTick(spec: CronSpec, from: Date): Date {
-  const next = new Date(from)
-  next.setSeconds(0, 0)
-  next.setMinutes(next.getMinutes() + 1)
-  const limit = 367 * 24 * 60 // minutes in ~1 year
-  for (let i = 0; i < limit; i++) {
-    const minute = next.getMinutes()
-    const hour = next.getHours()
-    const dom = next.getDate()
-    const month = next.getMonth() + 1
-    const dow = next.getDay()
-    const domMatch = spec.dom.has(dom)
-    const dowMatch = spec.dow.has(dow)
-    const dayMatch =
-      spec.domStar && spec.dowStar
-        ? true
-        : spec.domStar
-        ? dowMatch
-        : spec.dowStar
-        ? domMatch
-        : domMatch || dowMatch
-    if (
-      spec.minute.has(minute) &&
-      spec.hour.has(hour) &&
-      spec.month.has(month) &&
-      dayMatch
-    ) {
-      return next
-    }
-    next.setMinutes(next.getMinutes() + 1)
-  }
-  throw new Error(`no cron match within 1 year for spec`)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,10 +179,10 @@ await mcp.connect(new StdioServerTransport())
 
 function nextDelayMs(s: Schedule): { delayMs: number; nextAt: Date } {
   if (s.cronSpec) {
-    const nextAt = nextCronTick(s.cronSpec, new Date())
-    // Floor to 60s in cron mode: cron's smallest unit is 1 minute, so any
-    // "next tick is <60s away" is setTimeout drift firing the current tick
-    // a hair early — without this the just-fired minute matches again.
+    // cronSearchSeed rounds `now` to the nearest minute so an early-firing
+    // setTimeout (now still inside the prior minute) can't re-match the tick we
+    // just fired and emit a duplicate ~60s later. See cron.ts for the full why.
+    const nextAt = nextCronTick(s.cronSpec, cronSearchSeed(Date.now()))
     return { delayMs: Math.max(60_000, nextAt.getTime() - Date.now()), nextAt }
   }
   // Uniform jitter in [-jitterMin, +jitterMin]
